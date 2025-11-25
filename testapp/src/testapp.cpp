@@ -13,6 +13,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <memory>
+#include <fstream>
+#include <sstream>
+#include <map>
 #include "JoyConDecoder.h"
 #include <Windows.h>
 
@@ -30,6 +33,37 @@ constexpr uint16_t JOYCON_MANUFACTURER_ID = 1363; // Nintendo
 const std::vector<uint8_t> JOYCON_MANUFACTURER_PREFIX = { 0x01, 0x00, 0x03, 0x7E };
 const wchar_t* INPUT_REPORT_UUID = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
 const wchar_t* WRITE_COMMAND_UUID = L"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
+
+// GL/GR Button Mapping Configuration
+enum class ButtonMapping {
+    NONE,
+    L3,        // Left stick click
+    R3,        // Right stick click
+    L1,        // Left shoulder
+    R1,        // Right shoulder
+    L2,        // Left trigger
+    R2,        // Right trigger
+    CROSS,     // X / A
+    CIRCLE,    // O / B
+    SQUARE,    // □ / X
+    TRIANGLE,  // △ / Y
+    SHARE,     // Share / Back
+    OPTIONS,   // Options / Start
+    DPAD_UP,
+    DPAD_DOWN,
+    DPAD_LEFT,
+    DPAD_RIGHT
+};
+
+struct ProControllerConfig {
+    ButtonMapping glMapping = ButtonMapping::L3;
+    ButtonMapping grMapping = ButtonMapping::R3;
+};
+
+const std::string CONFIG_FILE = "joycon2cpp_config.txt";
+
+// Global config instance
+ProControllerConfig g_proControllerConfig;
 
 PVIGEM_CLIENT vigem_client = nullptr;
 
@@ -62,6 +96,238 @@ void PrintRawNotification(const std::vector<uint8_t>& buffer)
         printf("%02X ", b);
     }
     std::cout << std::endl;
+}
+
+// Helper: Convert ButtonMapping to string
+std::string ButtonMappingToString(ButtonMapping mapping) {
+    switch (mapping) {
+        case ButtonMapping::NONE: return "NONE";
+        case ButtonMapping::L3: return "L3";
+        case ButtonMapping::R3: return "R3";
+        case ButtonMapping::L1: return "L1";
+        case ButtonMapping::R1: return "R1";
+        case ButtonMapping::L2: return "L2";
+        case ButtonMapping::R2: return "R2";
+        case ButtonMapping::CROSS: return "CROSS";
+        case ButtonMapping::CIRCLE: return "CIRCLE";
+        case ButtonMapping::SQUARE: return "SQUARE";
+        case ButtonMapping::TRIANGLE: return "TRIANGLE";
+        case ButtonMapping::SHARE: return "SHARE";
+        case ButtonMapping::OPTIONS: return "OPTIONS";
+        case ButtonMapping::DPAD_UP: return "DPAD_UP";
+        case ButtonMapping::DPAD_DOWN: return "DPAD_DOWN";
+        case ButtonMapping::DPAD_LEFT: return "DPAD_LEFT";
+        case ButtonMapping::DPAD_RIGHT: return "DPAD_RIGHT";
+        default: return "NONE";
+    }
+}
+
+// Helper: Convert string to ButtonMapping
+ButtonMapping StringToButtonMapping(const std::string& str) {
+    if (str == "L3") return ButtonMapping::L3;
+    if (str == "R3") return ButtonMapping::R3;
+    if (str == "L1") return ButtonMapping::L1;
+    if (str == "R1") return ButtonMapping::R1;
+    if (str == "L2") return ButtonMapping::L2;
+    if (str == "R2") return ButtonMapping::R2;
+    if (str == "CROSS") return ButtonMapping::CROSS;
+    if (str == "CIRCLE") return ButtonMapping::CIRCLE;
+    if (str == "SQUARE") return ButtonMapping::SQUARE;
+    if (str == "TRIANGLE") return ButtonMapping::TRIANGLE;
+    if (str == "SHARE") return ButtonMapping::SHARE;
+    if (str == "OPTIONS") return ButtonMapping::OPTIONS;
+    if (str == "DPAD_UP") return ButtonMapping::DPAD_UP;
+    if (str == "DPAD_DOWN") return ButtonMapping::DPAD_DOWN;
+    if (str == "DPAD_LEFT") return ButtonMapping::DPAD_LEFT;
+    if (str == "DPAD_RIGHT") return ButtonMapping::DPAD_RIGHT;
+    return ButtonMapping::NONE;
+}
+
+// Load config from file
+bool LoadProControllerConfig(ProControllerConfig& config) {
+    std::ifstream file(CONFIG_FILE);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line)) {
+        size_t pos = line.find('=');
+        if (pos == std::string::npos) continue;
+
+        std::string key = line.substr(0, pos);
+        std::string value = line.substr(pos + 1);
+
+        if (key == "GL") {
+            config.glMapping = StringToButtonMapping(value);
+        } else if (key == "GR") {
+            config.grMapping = StringToButtonMapping(value);
+        }
+    }
+
+    file.close();
+    return true;
+}
+
+// Save config to file
+void SaveProControllerConfig(const ProControllerConfig& config) {
+    std::ofstream file(CONFIG_FILE);
+    if (!file.is_open()) {
+        std::cerr << "Failed to save config file.\n";
+        return;
+    }
+
+    file << "GL=" << ButtonMappingToString(config.glMapping) << "\n";
+    file << "GR=" << ButtonMappingToString(config.grMapping) << "\n";
+
+    file.close();
+    std::cout << "Configuration saved to " << CONFIG_FILE << "\n";
+}
+
+// Prompt user for button mapping
+ButtonMapping PromptForButtonMapping(const std::string& buttonName) {
+    std::cout << "\nSelect mapping for " << buttonName << " button:\n";
+    std::cout << "  1. L3 (Left Stick Click)\n";
+    std::cout << "  2. R3 (Right Stick Click)\n";
+    std::cout << "  3. L1 (Left Shoulder)\n";
+    std::cout << "  4. R1 (Right Shoulder)\n";
+    std::cout << "  5. L2 (Left Trigger)\n";
+    std::cout << "  6. R2 (Right Trigger)\n";
+    std::cout << "  7. Cross (X/A)\n";
+    std::cout << "  8. Circle (O/B)\n";
+    std::cout << "  9. Square (□/X)\n";
+    std::cout << " 10. Triangle (△/Y)\n";
+    std::cout << " 11. Share (Back)\n";
+    std::cout << " 12. Options (Start)\n";
+    std::cout << " 13. D-Pad Up\n";
+    std::cout << " 14. D-Pad Down\n";
+    std::cout << " 15. D-Pad Left\n";
+    std::cout << " 16. D-Pad Right\n";
+    std::cout << " 17. None (Disable)\n";
+    std::cout << "Enter choice (1-17): ";
+
+    int choice;
+    std::cin >> choice;
+    std::cin.ignore((std::numeric_limits<std::streamsize>::max)(), '\n');
+
+    switch (choice) {
+        case 1: return ButtonMapping::L3;
+        case 2: return ButtonMapping::R3;
+        case 3: return ButtonMapping::L1;
+        case 4: return ButtonMapping::R1;
+        case 5: return ButtonMapping::L2;
+        case 6: return ButtonMapping::R2;
+        case 7: return ButtonMapping::CROSS;
+        case 8: return ButtonMapping::CIRCLE;
+        case 9: return ButtonMapping::SQUARE;
+        case 10: return ButtonMapping::TRIANGLE;
+        case 11: return ButtonMapping::SHARE;
+        case 12: return ButtonMapping::OPTIONS;
+        case 13: return ButtonMapping::DPAD_UP;
+        case 14: return ButtonMapping::DPAD_DOWN;
+        case 15: return ButtonMapping::DPAD_LEFT;
+        case 16: return ButtonMapping::DPAD_RIGHT;
+        case 17: return ButtonMapping::NONE;
+        default:
+            std::cout << "Invalid choice, defaulting to NONE.\n";
+            return ButtonMapping::NONE;
+    }
+}
+
+// Configure GL/GR mappings interactively
+void ConfigureGLGRMappings() {
+    std::cout << "\n=== Configure GL/GR Back Buttons ===\n";
+    std::cout << "The Pro Controller 2 has two additional back buttons: GL and GR.\n";
+    std::cout << "You can map them to any controller button.\n";
+
+    g_proControllerConfig.glMapping = PromptForButtonMapping("GL");
+    g_proControllerConfig.grMapping = PromptForButtonMapping("GR");
+
+    SaveProControllerConfig(g_proControllerConfig);
+
+    std::cout << "\nConfiguration complete!\n";
+    std::cout << "  GL -> " << ButtonMappingToString(g_proControllerConfig.glMapping) << "\n";
+    std::cout << "  GR -> " << ButtonMappingToString(g_proControllerConfig.grMapping) << "\n\n";
+}
+
+// Apply ButtonMapping to DS4 report
+void ApplyButtonMapping(DS4_REPORT_EX& report, ButtonMapping mapping) {
+    switch (mapping) {
+        case ButtonMapping::L3:
+            report.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;
+            break;
+        case ButtonMapping::R3:
+            report.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;
+            break;
+        case ButtonMapping::L1:
+            report.Report.wButtons |= DS4_BUTTON_SHOULDER_LEFT;
+            break;
+        case ButtonMapping::R1:
+            report.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;
+            break;
+        case ButtonMapping::L2:
+            report.Report.bTriggerL = 255;
+            break;
+        case ButtonMapping::R2:
+            report.Report.bTriggerR = 255;
+            break;
+        case ButtonMapping::CROSS:
+            report.Report.wButtons |= DS4_BUTTON_CROSS;
+            break;
+        case ButtonMapping::CIRCLE:
+            report.Report.wButtons |= DS4_BUTTON_CIRCLE;
+            break;
+        case ButtonMapping::SQUARE:
+            report.Report.wButtons |= DS4_BUTTON_SQUARE;
+            break;
+        case ButtonMapping::TRIANGLE:
+            report.Report.wButtons |= DS4_BUTTON_TRIANGLE;
+            break;
+        case ButtonMapping::SHARE:
+            report.Report.wButtons |= DS4_BUTTON_SHARE;
+            break;
+        case ButtonMapping::OPTIONS:
+            report.Report.wButtons |= DS4_BUTTON_OPTIONS;
+            break;
+        case ButtonMapping::DPAD_UP:
+            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_NORTH);
+            break;
+        case ButtonMapping::DPAD_DOWN:
+            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_SOUTH);
+            break;
+        case ButtonMapping::DPAD_LEFT:
+            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_WEST);
+            break;
+        case ButtonMapping::DPAD_RIGHT:
+            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_EAST);
+            break;
+        case ButtonMapping::NONE:
+        default:
+            // Do nothing
+            break;
+    }
+}
+
+// Apply GL/GR mappings to Pro Controller report
+void ApplyGLGRMappings(DS4_REPORT_EX& report, const std::vector<uint8_t>& buffer) {
+    if (buffer.size() < 9) return;
+
+    // Build button state from bytes 3-8 (same as in JoyConDecoder)
+    uint64_t state = 0;
+    for (int i = 3; i <= 8; ++i) {
+        state = (state << 8) | buffer[i];
+    }
+
+    constexpr uint64_t BUTTON_GL_MASK = 0x000000000200;  // Bit 9
+    constexpr uint64_t BUTTON_GR_MASK = 0x000000000100;  // Bit 8
+
+    // Apply mappings if buttons are pressed
+    if (state & BUTTON_GL_MASK) {
+        ApplyButtonMapping(report, g_proControllerConfig.glMapping);
+    }
+    if (state & BUTTON_GR_MASK) {
+        ApplyButtonMapping(report, g_proControllerConfig.grMapping);
+    }
 }
 
 void SendCustomCommands(GattCharacteristic const& characteristic)
@@ -445,6 +711,26 @@ int main()
             std::getline(std::wcin, dummy);
         }
         else if (config.controllerType == ProController) {
+            // Load or configure GL/GR mappings
+            if (!LoadProControllerConfig(g_proControllerConfig)) {
+                std::cout << "\nNo existing configuration found for Pro Controller GL/GR buttons.\n";
+                std::cout << "Would you like to configure them now? (y/n): ";
+                std::string response;
+                std::getline(std::cin, response);
+
+                if (response == "y" || response == "Y") {
+                    ConfigureGLGRMappings();
+                } else {
+                    std::cout << "Using default mappings: GL->L3, GR->R3\n";
+                    SaveProControllerConfig(g_proControllerConfig);
+                }
+            } else {
+                std::cout << "\nLoaded GL/GR button configuration:\n";
+                std::cout << "  GL -> " << ButtonMappingToString(g_proControllerConfig.glMapping) << "\n";
+                std::cout << "  GR -> " << ButtonMappingToString(g_proControllerConfig.grMapping) << "\n";
+                std::cout << "To change this, delete " << CONFIG_FILE << " and restart.\n\n";
+            }
+
             std::wcout << L"Please sync your Pro Controller now.\n";
 
             ConnectedJoyCon proController = WaitForJoyCon(L"Waiting for Pro Controller...");
@@ -465,6 +751,9 @@ int main()
 
 
                     DS4_REPORT_EX report = GenerateProControllerReport(buffer);
+
+                    // Apply GL/GR button mappings
+                    ApplyGLGRMappings(report, buffer);
 
                     auto ret = vigem_target_ds4_update_ex(vigem_client, ds4_controller, report);
                     if (!VIGEM_SUCCESS(ret)) {
