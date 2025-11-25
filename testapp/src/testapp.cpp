@@ -578,6 +578,16 @@ int main()
 
             ConnectedJoyCon cj = WaitForJoyCon(L"Waiting for single Joy-Con...");
 
+            // Request minimum BLE connection interval for lowest latency
+            try {
+                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
+                cj.device.RequestPreferredConnectionParameters(connectionParams);
+                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency.\n";
+            }
+            catch (...) {
+                std::wcout << L"Warning: Could not request preferred connection parameters.\n";
+            }
+
             PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
             auto ret = vigem_target_add(vigem_client, ds4_controller);
             if (!VIGEM_SUCCESS(ret))
@@ -624,10 +634,30 @@ int main()
             if (rightJoyCon.writeChar)
                 SendCustomCommands(rightJoyCon.writeChar);
 
+            // Request minimum BLE connection interval for right Joy-Con
+            try {
+                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
+                rightJoyCon.device.RequestPreferredConnectionParameters(connectionParams);
+                std::wcout << L"Requested ThroughputOptimized connection parameters for RIGHT Joy-Con.\n";
+            }
+            catch (...) {
+                std::wcout << L"Warning: Could not request preferred connection parameters for RIGHT Joy-Con.\n";
+            }
+
             std::wcout << L"Please sync your LEFT Joy-Con now.\n";
             ConnectedJoyCon leftJoyCon = WaitForJoyCon(L"Waiting for LEFT Joy-Con...");
             if (leftJoyCon.writeChar)
                 SendCustomCommands(leftJoyCon.writeChar);
+
+            // Request minimum BLE connection interval for left Joy-Con
+            try {
+                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
+                leftJoyCon.device.RequestPreferredConnectionParameters(connectionParams);
+                std::wcout << L"Requested ThroughputOptimized connection parameters for LEFT Joy-Con.\n";
+            }
+            catch (...) {
+                std::wcout << L"Warning: Could not request preferred connection parameters for LEFT Joy-Con.\n";
+            }
 
             PVIGEM_TARGET ds4Controller = vigem_target_ds4_alloc();
             auto ret = vigem_target_add(vigem_client, ds4Controller);
@@ -735,6 +765,17 @@ int main()
 
             ConnectedJoyCon proController = WaitForJoyCon(L"Waiting for Pro Controller...");
 
+            // Request minimum BLE connection interval for lowest latency
+            try {
+                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
+                auto paramResult = proController.device.RequestPreferredConnectionParameters(connectionParams);
+
+                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency.\n";
+            }
+            catch (...) {
+                std::wcout << L"Warning: Could not request preferred connection parameters. Continuing with default settings.\n";
+            }
+
             PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
             auto ret = vigem_target_add(vigem_client, ds4_controller);
             if (!VIGEM_SUCCESS(ret))
@@ -782,6 +823,16 @@ int main()
             std::wcout << L"Please sync your NSO GameCube Controller now.\n";
 
             ConnectedJoyCon gcController = WaitForJoyCon(L"Waiting for NSO GC Controller...");
+
+            // Request minimum BLE connection interval for lowest latency
+            try {
+                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
+                gcController.device.RequestPreferredConnectionParameters(connectionParams);
+                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency.\n";
+            }
+            catch (...) {
+                std::wcout << L"Warning: Could not request preferred connection parameters.\n";
+            }
 
             PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
             auto ret = vigem_target_add(vigem_client, ds4_controller);
