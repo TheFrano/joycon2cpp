@@ -536,6 +536,7 @@ void SendKeyboardInput(WORD virtualKey, bool keyDown) {
 // Track button states to avoid repeated key presses
 static bool g_screenshotButtonPressed = false;
 static bool g_cButtonPressed = false;
+static bool g_comboPressed = false;
 
 // Flag for ZL+ZR+GL+GR combo to enter management window
 static std::atomic<bool> g_openManagementWindow(false);
@@ -557,12 +558,18 @@ void HandleSpecialProButtons(const std::vector<uint8_t>& buffer) {
     constexpr uint64_t TRIGGER_ZL_MASK = 0x000000800000;         // ZL trigger
     constexpr uint64_t TRIGGER_ZR_MASK = 0x008000000000;         // ZR trigger
 
-    // Check for ZL+ZR+GL+GR combo to open management window
-    bool comboPressed = (state & TRIGGER_ZL_MASK) && (state & TRIGGER_ZR_MASK) &&
-                        (state & BUTTON_GL_MASK) && (state & BUTTON_GR_MASK);
+    // Check for ZL+ZR+GL+GR combo to open management window (only trigger on initial press)
+    bool comboCurrentlyPressed = (state & TRIGGER_ZL_MASK) && (state & TRIGGER_ZR_MASK) &&
+                                  (state & BUTTON_GL_MASK) && (state & BUTTON_GR_MASK);
 
-    if (comboPressed) {
+    if (comboCurrentlyPressed && !g_comboPressed) {
+        // Combo just pressed - trigger management window
         g_openManagementWindow.store(true);
+        g_comboPressed = true;
+    }
+    else if (!comboCurrentlyPressed && g_comboPressed) {
+        // Combo released - reset state
+        g_comboPressed = false;
     }
 
     // Handle Screenshot button -> F12 key
