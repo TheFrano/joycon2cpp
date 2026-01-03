@@ -430,6 +430,8 @@ DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer)
     if (state & BUTTON_Y_MASK)        report.Report.wButtons |= DS4_BUTTON_SQUARE;
     if (state & BUTTON_L_SHOULDER)    report.Report.wButtons |= DS4_BUTTON_SHOULDER_LEFT;
     if (state & BUTTON_R_SHOULDER)    report.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;
+    if (state & TRIGGER_LT_MASK)      report.Report.wButtons |= DS4_BUTTON_TRIGGER_LEFT;
+    if (state & TRIGGER_RT_MASK)      report.Report.wButtons |= DS4_BUTTON_TRIGGER_RIGHT;
     if (state & BUTTON_L_THUMB)       report.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;
     if (state & BUTTON_R_THUMB)       report.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;
     if (state & BUTTON_BACK)          report.Report.wButtons |= DS4_BUTTON_SHARE;
@@ -453,8 +455,8 @@ DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer)
 
     DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), static_cast<DS4_DPAD_DIRECTIONS>(dpad));
 
-    report.Report.bTriggerL = (state & TRIGGER_LT_MASK) ? 255 : 0;
-    report.Report.bTriggerR = (state & TRIGGER_RT_MASK) ? 255 : 0;
+    report.Report.bTriggerL = buffer[0x3c];
+    report.Report.bTriggerR = buffer[0x3d];
 
     auto [lx, ly] = decode_pro_joystick(&buffer[10]);
     ly = -ly;
