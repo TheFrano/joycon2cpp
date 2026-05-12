@@ -149,6 +149,30 @@ huge thanks to [@german77](https://github.com/german77) for providing me with th
   `25°C + (raw / 127)`  
   → `25 + (3679 / 127) ≈ 54°C`
 - **Battery voltage**:  
-  Reported as millivolts. `3000` = 3.0V. If `0x0000`, likely unavailable at that time.
+Reported as millivolts. `3000` = 3.0V. If `0x0000`, likely unavailable at that time.
 
 ---
+
+## Latency diagnostics
+
+The test app can write an internal latency CSV while you compare update policies:
+
+```powershell
+.\testapp.exe --latency-test --update-policy low --latency-csv low.csv
+.\testapp.exe --latency-test --update-policy balanced --latency-csv balanced.csv
+.\testapp.exe --latency-test --update-policy legacy --latency-csv legacy.csv
+```
+
+Policies:
+
+- `low` / `LowLatency`: send a ViGEm update for each BLE notification.
+- `balanced` / `Balanced120Hz`: limit output to about 120 Hz.
+- `legacy` / `Legacy60Hz`: limit output to about 60 Hz for comparison.
+
+The CSV columns are:
+
+```text
+mode,controller_type,event_index,ble_delta_ms,buffer_age_left_ms,buffer_age_right_ms,decode_to_vigem_us,total_pipeline_us
+```
+
+For a repeatable manual comparison, run each policy with the same controller, keep it still for 10 seconds, then press one button 30 times at a steady rhythm. Repeat for Single Joy-Con, Dual Joy-Con, and Pro Controller. For perceived end-to-end latency, record the physical controller and gamepad-tester.com or Steam Input at 240 fps, count frames between the visible press and on-screen response, and convert with `latency_ms = frames / fps * 1000`.
