@@ -4,6 +4,8 @@ A C++ executable that makes Switch 2 controllers into working PC controllers.
 
 ---
 
+UI made with [ImGui](https://github.com/ocornut/imgui)
+
 ## DISCLAIMER
 
 This project is **Windows-only**, primarily because the `ViGEmBus Driver` (used for virtual controller output) is exclusive to Windows.  
