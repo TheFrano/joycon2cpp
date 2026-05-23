@@ -1,10 +1,20 @@
+#define NOMINMAX
+
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
-#pragma comment(lib, "setupapi.lib")
+
+#include <d3d11.h>
+#include <dxgi.h>
+#include <tchar.h>
+
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
+
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -19,11 +29,11 @@
 #include <chrono>
 #include <iomanip>
 #include <string>
-#include <conio.h>  // For _kbhit()
+#include <functional>
+
 #include "JoyConDecoder.h"
 #include "DsuServer.h"
 #include <Windows.h>
-
 #include <ViGEm/Client.h>
 #include <ViGEm/Common.h>
 
@@ -34,74 +44,211 @@ using namespace Windows::Devices::Bluetooth::GenericAttributeProfile;
 using namespace Windows::Storage::Streams;
 using namespace Windows::Foundation;
 
-constexpr uint16_t JOYCON_MANUFACTURER_ID = 1363; // Nintendo
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+constexpr uint16_t JOYCON_MANUFACTURER_ID = 1363;
 const std::vector<uint8_t> JOYCON_MANUFACTURER_PREFIX = { 0x01, 0x00, 0x03, 0x7E };
-const wchar_t* INPUT_REPORT_UUID = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
+const wchar_t* INPUT_REPORT_UUID  = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
 const wchar_t* WRITE_COMMAND_UUID = L"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
+const std::string CONFIG_FILE = "joycon2cpp_config.json";
 
-// GL/GR Button Mapping Configuration
+enum class UpdatePolicy { LowLatency, Balanced120Hz, Legacy60Hz };
+enum ControllerType { SingleJoyCon = 1, DualJoyCon = 2, ProController = 3, NSOGCController = 4 };
+
 enum class ButtonMapping {
-    NONE,
-    L3,        // Left stick click
-    R3,        // Right stick click
-    L1,        // Left shoulder
-    R1,        // Right shoulder
-    L2,        // Left trigger
-    R2,        // Right trigger
-    CROSS,     // X / A
-    CIRCLE,    // O / B
-    SQUARE,    // □ / X
-    TRIANGLE,  // △ / Y
-    SHARE,     // Share / Back
-    OPTIONS,   // Options / Start
-    DPAD_UP,
-    DPAD_DOWN,
-    DPAD_LEFT,
-    DPAD_RIGHT
+    NONE, L3, R3, L1, R1, L2, R2,
+    CROSS, CIRCLE, SQUARE, TRIANGLE,
+    SHARE, OPTIONS,
+    DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT
 };
 
-// Single GL/GR mapping layout
+enum class AppScreen { Setup, Connecting, Running };
+
 struct GLGRLayout {
-    std::string name;
-    ButtonMapping glMapping;
-    ButtonMapping grMapping;
+    char name[64] = "Layout 1";
+    ButtonMapping glMapping = ButtonMapping::NONE;
+    ButtonMapping grMapping = ButtonMapping::NONE;
 };
 
-// Pro Controller configuration with multiple layouts
 struct ProControllerConfig {
     std::vector<GLGRLayout> layouts;
     int activeLayoutIndex = 0;
 };
 
-const std::string CONFIG_FILE = "joycon2cpp_config.json";
-
-// Global config instance
-ProControllerConfig g_proControllerConfig;
-
-PVIGEM_CLIENT vigem_client = nullptr;
-
-using SteadyClock = std::chrono::steady_clock;
-using TimePoint = SteadyClock::time_point;
-
-enum class UpdatePolicy {
-    LowLatency,
-    Balanced120Hz,
-    Legacy60Hz
+struct RuntimeOptions {
+    bool latencyMetrics = false;
+    UpdatePolicy updatePolicy = UpdatePolicy::LowLatency;
+    char latencyCsvPath[256] = "latency_benchmark.csv";
 };
 
-const char* UpdatePolicyName(UpdatePolicy policy)
-{
-    switch (policy) {
-        case UpdatePolicy::LowLatency: return "LowLatency";
-        case UpdatePolicy::Balanced120Hz: return "Balanced120Hz";
-        case UpdatePolicy::Legacy60Hz: return "Legacy60Hz";
-        default: return "Unknown";
-    }
+struct PlayerConfig {
+    ControllerType controllerType = SingleJoyCon;
+    JoyConSide     joyconSide        = JoyConSide::Left;
+    JoyConOrientation joyconOrientation = JoyConOrientation::Upright;
+    GyroSource     gyroSource        = GyroSource::Both;
+    GyroMode       gyroMode          = GyroMode::DS4Raw;
+    MotionProfile  motionProfile     = MotionProfile::Raw;
+};
+
+struct ConnectedJoyCon {
+    BluetoothLEDevice      device    = nullptr;
+    GattCharacteristic     inputChar = nullptr;
+    GattCharacteristic     writeChar = nullptr;
+};
+
+using SteadyClock = std::chrono::steady_clock;
+using TimePoint   = SteadyClock::time_point;
+
+struct LatencyTracker {
+    TimePoint lastBleTime{};
+    TimePoint lastEmitTime{};
+    uint64_t  eventIndex = 0;
+};
+
+struct TimedInputBuffer {
+    std::vector<uint8_t> buffer;
+    TimePoint  receivedAt{};
+    double     bleDeltaMs = -1.0;
+    uint64_t   sequence   = 0;
+};
+
+struct DualJoyConSharedState {
+    std::mutex              mutex;
+    std::condition_variable cv;
+    TimedInputBuffer        left, right;
+    TimePoint               lastLeftBleTime{}, lastRightBleTime{}, lastEmitTime{};
+    uint64_t                sequence = 0, eventIndex = 0;
+};
+
+struct SingleJoyConPlayer {
+    ConnectedJoyCon joycon;
+    PVIGEM_TARGET   ds4Controller = nullptr;
+    JoyConSide      side;
+    JoyConOrientation orientation;
+    int             mouseMode      = 0;
+    bool            wasChatPressed = false;
+    int16_t         lastOpticalX   = 0, lastOpticalY = 0;
+    bool            firstOpticalRead = true;
+    float           scrollAccumulator = 0.f;
+    bool            mb4Pressed = false, mb5Pressed = false;
+    bool            leftBtnPressed = false, rightBtnPressed = false, middleBtnPressed = false;
+    LatencyTracker  latency;
+};
+
+struct DualJoyConPlayer {
+    ConnectedJoyCon leftJoyCon, rightJoyCon;
+    GyroSource      gyroSource;
+    GyroMode        gyroMode;
+    MotionProfile   motionProfile;
+    uint8_t         dsuSlot = 0;
+    PVIGEM_TARGET   ds4Controller = nullptr;
+    std::atomic<bool> running{false};
+    std::thread     updateThread;
+    std::shared_ptr<DualJoyConSharedState> sharedState;
+};
+
+struct ProControllerPlayer {
+    ConnectedJoyCon controller;
+    PVIGEM_TARGET   ds4Controller = nullptr;
+    LatencyTracker  latency;
+};
+
+struct ConnectionTask {
+    std::string        label;
+    bool               done    = false;
+    bool               success = false;
+    std::string        statusMsg;
+    ConnectedJoyCon    result;
+    std::thread        worker;
+};
+
+static AppScreen              g_screen        = AppScreen::Setup;
+static RuntimeOptions         g_opts;
+static ProControllerConfig    g_proConfig;
+static PVIGEM_CLIENT          g_vigem         = nullptr;
+static DsuServer              g_dsuServer;
+
+static std::vector<PlayerConfig>                    g_playerConfigs;
+static std::vector<SingleJoyConPlayer>              g_singlePlayers;
+static std::vector<std::unique_ptr<DualJoyConPlayer>> g_dualPlayers;
+static std::vector<ProControllerPlayer>             g_proPlayers;
+
+static std::vector<ConnectionTask>  g_connectionTasks;
+static int                          g_connectionTaskIndex = 0;
+static bool                         g_connectionDone      = false;
+static std::string                  g_connectionError;
+
+static bool g_showLayoutManager = false;
+static bool g_screenshotButtonPressed = false;
+static bool g_cButtonPressed          = false;
+static bool g_comboPressed            = false;
+static std::atomic<bool> g_openLayoutManager{false};
+
+static std::mutex         g_logMutex;
+static std::vector<std::string> g_logLines;
+static void AppLog(const std::string& s) {
+    std::lock_guard<std::mutex> lk(g_logMutex);
+    g_logLines.push_back(s);
+    if (g_logLines.size() > 200) g_logLines.erase(g_logLines.begin());
 }
 
-const char* ControllerTypeName(int controllerType)
-{
-    switch (controllerType) {
+class LatencyCsvLogger {
+public:
+    bool Start(const std::string& path) {
+        std::lock_guard<std::mutex> lk(m_mutex);
+        m_file.open(path, std::ios::out | std::ios::trunc);
+        if (!m_file.is_open()) return false;
+        m_file << "mode,controller_type,event_index,ble_delta_ms,buffer_age_left_ms,buffer_age_right_ms,decode_to_vigem_us,total_pipeline_us\n";
+        m_enabled = true;
+        return true;
+    }
+    bool Enabled() const { return m_enabled.load(std::memory_order_acquire); }
+    void Record(UpdatePolicy pol, const char* ct, uint64_t idx,
+                double bleDelta, double ageL, double ageR, double decUs, double totUs) {
+        if (!Enabled()) return;
+        std::lock_guard<std::mutex> lk(m_mutex);
+        if (!m_file.is_open()) return;
+        m_file << PolicyName(pol) << ',' << ct << ',' << idx << ','
+               << std::fixed << std::setprecision(3)
+               << bleDelta << ',' << ageL << ',' << ageR << ','
+               << std::setprecision(1) << decUs << ',' << totUs << '\n';
+    }
+    static const char* PolicyName(UpdatePolicy p) {
+        switch(p) {
+            case UpdatePolicy::LowLatency:    return "LowLatency";
+            case UpdatePolicy::Balanced120Hz: return "Balanced120Hz";
+            case UpdatePolicy::Legacy60Hz:    return "Legacy60Hz";
+            default: return "Unknown";
+        }
+    }
+private:
+    std::atomic<bool> m_enabled{false};
+    std::mutex        m_mutex;
+    std::ofstream     m_file;
+};
+static LatencyCsvLogger g_latencyLogger;
+
+static double MsBetween(TimePoint a, TimePoint b) {
+    if (a == TimePoint{}) return -1.0;
+    return std::chrono::duration<double, std::milli>(b - a).count();
+}
+static double UsBetween(TimePoint a, TimePoint b) {
+    return std::chrono::duration<double, std::micro>(b - a).count();
+}
+static std::chrono::microseconds PolicyInterval(UpdatePolicy p) {
+    switch(p) {
+        case UpdatePolicy::Balanced120Hz: return std::chrono::microseconds(8333);
+        case UpdatePolicy::Legacy60Hz:    return std::chrono::microseconds(16667);
+        default:                          return std::chrono::microseconds(0);
+    }
+}
+static bool ShouldEmit(UpdatePolicy p, TimePoint& last, TimePoint now) {
+    auto iv = PolicyInterval(p);
+    if (iv.count() == 0 || last == TimePoint{} || now - last >= iv) { last = now; return true; }
+    return false;
+}
+static const char* CtrlTypeName(int t) {
+    switch(t) {
         case 1: return "SingleJoyCon";
         case 2: return "DualJoyCon";
         case 3: return "ProController";
@@ -110,1850 +257,1210 @@ const char* ControllerTypeName(int controllerType)
     }
 }
 
-struct RuntimeOptions {
-    bool latencyMetrics = false;
-    UpdatePolicy updatePolicy = UpdatePolicy::LowLatency;
-    std::string latencyCsvPath = "latency_benchmark.csv";
+static const char* BtnMapNames[] = {
+    "None","L3","R3","L1","R1","L2","R2",
+    "Cross","Circle","Square","Triangle",
+    "Share","Options",
+    "DPad Up","DPad Down","DPad Left","DPad Right"
 };
-
-RuntimeOptions g_runtimeOptions;
-
-class LatencyCsvLogger {
-public:
-    bool Start(const std::string& path)
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_file.open(path, std::ios::out | std::ios::trunc);
-        if (!m_file.is_open()) {
-            return false;
-        }
-
-        m_file << "mode,controller_type,event_index,ble_delta_ms,buffer_age_left_ms,buffer_age_right_ms,decode_to_vigem_us,total_pipeline_us\n";
-        m_enabled = true;
-        return true;
-    }
-
-    bool Enabled() const
-    {
-        return m_enabled.load(std::memory_order_acquire);
-    }
-
-    void Record(
-        UpdatePolicy policy,
-        const char* controllerType,
-        uint64_t eventIndex,
-        double bleDeltaMs,
-        double bufferAgeLeftMs,
-        double bufferAgeRightMs,
-        double decodeToVigemUs,
-        double totalPipelineUs)
-    {
-        if (!Enabled()) {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_file.is_open()) {
-            return;
-        }
-
-        m_file << UpdatePolicyName(policy) << ','
-               << controllerType << ','
-               << eventIndex << ','
-               << std::fixed << std::setprecision(3)
-               << bleDeltaMs << ','
-               << bufferAgeLeftMs << ','
-               << bufferAgeRightMs << ','
-               << std::setprecision(1)
-               << decodeToVigemUs << ','
-               << totalPipelineUs << '\n';
-    }
-
-private:
-    std::atomic<bool> m_enabled{ false };
-    std::mutex m_mutex;
-    std::ofstream m_file;
-};
-
-LatencyCsvLogger g_latencyLogger;
-
-double MillisecondsBetween(TimePoint start, TimePoint end)
-{
-    if (start == TimePoint{}) {
-        return -1.0;
-    }
-    return std::chrono::duration<double, std::milli>(end - start).count();
-}
-
-double MicrosecondsBetween(TimePoint start, TimePoint end)
-{
-    return std::chrono::duration<double, std::micro>(end - start).count();
-}
-
-std::chrono::microseconds PolicyInterval(UpdatePolicy policy)
-{
-    switch (policy) {
-        case UpdatePolicy::Balanced120Hz:
-            return std::chrono::microseconds(8333);
-        case UpdatePolicy::Legacy60Hz:
-            return std::chrono::microseconds(16667);
-        case UpdatePolicy::LowLatency:
-        default:
-            return std::chrono::microseconds(0);
-    }
-}
-
-bool ShouldEmitForPolicy(UpdatePolicy policy, TimePoint& lastEmit, TimePoint now)
-{
-    const auto interval = PolicyInterval(policy);
-    if (interval.count() == 0 || lastEmit == TimePoint{} || now - lastEmit >= interval) {
-        lastEmit = now;
-        return true;
-    }
-    return false;
-}
-
-struct LatencyTracker {
-    TimePoint lastBleTime{};
-    TimePoint lastEmitTime{};
-    uint64_t eventIndex = 0;
-};
-
-void InitializeViGEm()
-{
-    if (vigem_client != nullptr)
-        return;
-
-    vigem_client = vigem_alloc();
-    if (vigem_client == nullptr)
-    {
-        std::wcerr << L"Failed to allocate ViGEm client.\n";
-        exit(1);
-    }
-
-    auto ret = vigem_connect(vigem_client);
-    if (!VIGEM_SUCCESS(ret))
-    {
-        std::wcerr << L"Failed to connect to ViGEm bus: 0x" << std::hex << ret << L"\n";
-        exit(1);
-    }
-
-    std::wcout << L"ViGEm client initialized and connected.\n";
-}
-
-void PrintRawNotification(const std::vector<uint8_t>& buffer)
-{
-    std::cout << "[Raw Notification] ";
-    for (auto b : buffer) {
-        printf("%02X ", b);
-    }
-    std::cout << std::endl;
-}
-
-// Helper: Convert ButtonMapping to string
-std::string ButtonMappingToString(ButtonMapping mapping) {
-    switch (mapping) {
-        case ButtonMapping::NONE: return "NONE";
-        case ButtonMapping::L3: return "L3";
-        case ButtonMapping::R3: return "R3";
-        case ButtonMapping::L1: return "L1";
-        case ButtonMapping::R1: return "R1";
-        case ButtonMapping::L2: return "L2";
-        case ButtonMapping::R2: return "R2";
-        case ButtonMapping::CROSS: return "CROSS";
-        case ButtonMapping::CIRCLE: return "CIRCLE";
-        case ButtonMapping::SQUARE: return "SQUARE";
-        case ButtonMapping::TRIANGLE: return "TRIANGLE";
-        case ButtonMapping::SHARE: return "SHARE";
-        case ButtonMapping::OPTIONS: return "OPTIONS";
-        case ButtonMapping::DPAD_UP: return "DPAD_UP";
-        case ButtonMapping::DPAD_DOWN: return "DPAD_DOWN";
-        case ButtonMapping::DPAD_LEFT: return "DPAD_LEFT";
-        case ButtonMapping::DPAD_RIGHT: return "DPAD_RIGHT";
-        default: return "NONE";
-    }
-}
-
-// Helper: Convert string to ButtonMapping
-ButtonMapping StringToButtonMapping(const std::string& str) {
-    if (str == "L3") return ButtonMapping::L3;
-    if (str == "R3") return ButtonMapping::R3;
-    if (str == "L1") return ButtonMapping::L1;
-    if (str == "R1") return ButtonMapping::R1;
-    if (str == "L2") return ButtonMapping::L2;
-    if (str == "R2") return ButtonMapping::R2;
-    if (str == "CROSS") return ButtonMapping::CROSS;
-    if (str == "CIRCLE") return ButtonMapping::CIRCLE;
-    if (str == "SQUARE") return ButtonMapping::SQUARE;
-    if (str == "TRIANGLE") return ButtonMapping::TRIANGLE;
-    if (str == "SHARE") return ButtonMapping::SHARE;
-    if (str == "OPTIONS") return ButtonMapping::OPTIONS;
-    if (str == "DPAD_UP") return ButtonMapping::DPAD_UP;
-    if (str == "DPAD_DOWN") return ButtonMapping::DPAD_DOWN;
-    if (str == "DPAD_LEFT") return ButtonMapping::DPAD_LEFT;
-    if (str == "DPAD_RIGHT") return ButtonMapping::DPAD_RIGHT;
+static const char* BtnMapStr(ButtonMapping m) { return BtnMapNames[(int)m]; }
+static ButtonMapping BtnMapFromStr(const std::string& s) {
+    for (int i = 0; i < 17; i++)
+        if (s == BtnMapNames[i]) return (ButtonMapping)i;
     return ButtonMapping::NONE;
 }
 
-// Simple JSON serialization for our config
-std::string ConfigToJSON(const ProControllerConfig& config) {
-    std::stringstream ss;
-    ss << "{\n";
-    ss << "  \"activeLayoutIndex\": " << config.activeLayoutIndex << ",\n";
-    ss << "  \"layouts\": [\n";
-
-    for (size_t i = 0; i < config.layouts.size(); ++i) {
-        const auto& layout = config.layouts[i];
-        ss << "    {\n";
-        ss << "      \"name\": \"" << layout.name << "\",\n";
-        ss << "      \"glMapping\": \"" << ButtonMappingToString(layout.glMapping) << "\",\n";
-        ss << "      \"grMapping\": \"" << ButtonMappingToString(layout.grMapping) << "\"\n";
-        ss << "    }";
-        if (i < config.layouts.size() - 1) ss << ",";
-        ss << "\n";
+static void SaveProConfig() {
+    std::ofstream f(CONFIG_FILE);
+    if (!f.is_open()) return;
+    f << "{\n  \"activeLayoutIndex\": " << g_proConfig.activeLayoutIndex << ",\n  \"layouts\": [\n";
+    for (size_t i = 0; i < g_proConfig.layouts.size(); ++i) {
+        auto& l = g_proConfig.layouts[i];
+        f << "    {\"name\":\"" << l.name << "\","
+          << "\"glMapping\":\"" << BtnMapStr(l.glMapping) << "\","
+          << "\"grMapping\":\"" << BtnMapStr(l.grMapping) << "\"}";
+        if (i+1 < g_proConfig.layouts.size()) f << ",";
+        f << "\n";
     }
-
-    ss << "  ]\n";
-    ss << "}\n";
-    return ss.str();
+    f << "  ]\n}\n";
 }
-
-// Simple JSON parsing for our config
-bool JSONToConfig(const std::string& json, ProControllerConfig& config) {
-    config.layouts.clear();
-    config.activeLayoutIndex = 0;
-
-    // Simple parser for our specific JSON structure
-    size_t pos = 0;
-
-    // Find activeLayoutIndex
-    size_t activePos = json.find("\"activeLayoutIndex\"");
-    if (activePos != std::string::npos) {
-        size_t colonPos = json.find(':', activePos);
-        size_t commaPos = json.find_first_of(",\n", colonPos);
-        std::string value = json.substr(colonPos + 1, commaPos - colonPos - 1);
-        // Trim whitespace
-        value.erase(0, value.find_first_not_of(" \t\n\r"));
-        value.erase(value.find_last_not_of(" \t\n\r") + 1);
-        config.activeLayoutIndex = std::stoi(value);
-    }
-
-    // Find layouts array
-    size_t layoutsStart = json.find("\"layouts\"");
-    if (layoutsStart == std::string::npos) return false;
-
-    size_t arrayStart = json.find('[', layoutsStart);
-    if (arrayStart == std::string::npos) return false;
-
-    // Parse each layout object
-    pos = arrayStart + 1;
-    while (pos < json.length()) {
-        size_t objectStart = json.find('{', pos);
-        if (objectStart == std::string::npos) break;
-
-        size_t objectEnd = json.find('}', objectStart);
-        if (objectEnd == std::string::npos) break;
-
-        std::string objectStr = json.substr(objectStart, objectEnd - objectStart + 1);
-
-        GLGRLayout layout;
-
-        // Parse name
-        size_t namePos = objectStr.find("\"name\"");
-        if (namePos != std::string::npos) {
-            size_t nameStart = objectStr.find('\"', namePos + 6);
-            size_t nameEnd = objectStr.find('\"', nameStart + 1);
-            layout.name = objectStr.substr(nameStart + 1, nameEnd - nameStart - 1);
-        }
-
-        // Parse glMapping
-        size_t glPos = objectStr.find("\"glMapping\"");
-        if (glPos != std::string::npos) {
-            size_t glStart = objectStr.find('\"', glPos + 11);
-            size_t glEnd = objectStr.find('\"', glStart + 1);
-            std::string glStr = objectStr.substr(glStart + 1, glEnd - glStart - 1);
-            layout.glMapping = StringToButtonMapping(glStr);
-        }
-
-        // Parse grMapping
-        size_t grPos = objectStr.find("\"grMapping\"");
-        if (grPos != std::string::npos) {
-            size_t grStart = objectStr.find('\"', grPos + 11);
-            size_t grEnd = objectStr.find('\"', grStart + 1);
-            std::string grStr = objectStr.substr(grStart + 1, grEnd - grStart - 1);
-            layout.grMapping = StringToButtonMapping(grStr);
-        }
-
-        config.layouts.push_back(layout);
-
-        pos = objectEnd + 1;
-        // Check if there's another object
-        size_t nextComma = json.find(',', pos);
-        size_t arrayEnd = json.find(']', pos);
-        if (arrayEnd != std::string::npos && (nextComma == std::string::npos || arrayEnd < nextComma)) {
-            break;
-        }
-    }
-
-    return !config.layouts.empty();
-}
-
-// Load config from JSON file
-bool LoadProControllerConfig(ProControllerConfig& config) {
-    std::ifstream file(CONFIG_FILE);
-    if (!file.is_open()) {
-        return false;
-    }
-
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    file.close();
-
-    return JSONToConfig(buffer.str(), config);
-}
-
-// Save config to JSON file
-void SaveProControllerConfig(const ProControllerConfig& config) {
-    std::ofstream file(CONFIG_FILE);
-    if (!file.is_open()) {
-        std::cerr << "Failed to save config file.\n";
+static void LoadProConfig() {
+    std::ifstream f(CONFIG_FILE);
+    if (!f.is_open()) {
+        GLGRLayout def; def.glMapping = ButtonMapping::NONE; def.grMapping = ButtonMapping::NONE;
+        g_proConfig.layouts.push_back(def);
+        g_proConfig.activeLayoutIndex = 0;
+        SaveProConfig();
         return;
     }
-
-    file << ConfigToJSON(config);
-    file.close();
-    std::cout << "Configuration saved to " << CONFIG_FILE << "\n";
-}
-
-// Prompt user for button mapping
-ButtonMapping PromptForButtonMapping(const std::string& buttonName) {
-    std::cout << "\nSelect mapping for " << buttonName << " button:\n";
-    std::cout << "  1. L3 (Left Stick Click)\n";
-    std::cout << "  2. R3 (Right Stick Click)\n";
-    std::cout << "  3. L1 (Left Shoulder)\n";
-    std::cout << "  4. R1 (Right Shoulder)\n";
-    std::cout << "  5. L2 (Left Trigger)\n";
-    std::cout << "  6. R2 (Right Trigger)\n";
-    std::cout << "  7. Cross (X/A)\n";
-    std::cout << "  8. Circle (O/B)\n";
-    std::cout << "  9. Square (□/X)\n";
-    std::cout << " 10. Triangle (△/Y)\n";
-    std::cout << " 11. Share (Back)\n";
-    std::cout << " 12. Options (Start)\n";
-    std::cout << " 13. D-Pad Up\n";
-    std::cout << " 14. D-Pad Down\n";
-    std::cout << " 15. D-Pad Left\n";
-    std::cout << " 16. D-Pad Right\n";
-    std::cout << " 17. None (Disable)\n";
-    std::cout << "Enter choice (1-17): ";
-
-    int choice;
-    std::cin >> choice;
-    std::cin.ignore((std::numeric_limits<std::streamsize>::max)(), '\n');
-
-    switch (choice) {
-        case 1: return ButtonMapping::L3;
-        case 2: return ButtonMapping::R3;
-        case 3: return ButtonMapping::L1;
-        case 4: return ButtonMapping::R1;
-        case 5: return ButtonMapping::L2;
-        case 6: return ButtonMapping::R2;
-        case 7: return ButtonMapping::CROSS;
-        case 8: return ButtonMapping::CIRCLE;
-        case 9: return ButtonMapping::SQUARE;
-        case 10: return ButtonMapping::TRIANGLE;
-        case 11: return ButtonMapping::SHARE;
-        case 12: return ButtonMapping::OPTIONS;
-        case 13: return ButtonMapping::DPAD_UP;
-        case 14: return ButtonMapping::DPAD_DOWN;
-        case 15: return ButtonMapping::DPAD_LEFT;
-        case 16: return ButtonMapping::DPAD_RIGHT;
-        case 17: return ButtonMapping::NONE;
-        default:
-            std::cout << "Invalid choice, defaulting to NONE.\n";
-            return ButtonMapping::NONE;
-    }
-}
-
-// Configure GL/GR mappings interactively
-// Create default config with one empty layout
-void CreateDefaultConfig() {
-    g_proControllerConfig.layouts.clear();
-    GLGRLayout defaultLayout;
-    defaultLayout.name = "Layout 1";
-    defaultLayout.glMapping = ButtonMapping::NONE;
-    defaultLayout.grMapping = ButtonMapping::NONE;
-    g_proControllerConfig.layouts.push_back(defaultLayout);
-    g_proControllerConfig.activeLayoutIndex = 0;
-    SaveProControllerConfig(g_proControllerConfig);
-}
-
-// Configure a single layout
-void ConfigureLayout(GLGRLayout& layout) {
-    std::cout << "\n=== Configure GL/GR Mapping ===\n";
-    std::cout << "Layout Name: " << layout.name << "\n\n";
-
-    layout.glMapping = PromptForButtonMapping("GL");
-    layout.grMapping = PromptForButtonMapping("GR");
-
-    std::cout << "\nLayout configured!\n";
-    std::cout << "  GL -> " << ButtonMappingToString(layout.glMapping) << "\n";
-    std::cout << "  GR -> " << ButtonMappingToString(layout.grMapping) << "\n";
-}
-
-// Layout management window
-void ShowLayoutManagementWindow() {
-    while (true) {
-        std::cout << "\n==================================================\n";
-        std::cout << "          GL/GR LAYOUT MANAGEMENT\n";
-        std::cout << "==================================================\n";
-        std::cout << "Current active layout: " << g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].name << "\n\n";
-        std::cout << "Available Layouts:\n";
-
-        for (size_t i = 0; i < g_proControllerConfig.layouts.size(); ++i) {
-            const auto& layout = g_proControllerConfig.layouts[i];
-            std::cout << "  " << (i + 1) << ". " << layout.name;
-            if (i == static_cast<size_t>(g_proControllerConfig.activeLayoutIndex)) {
-                std::cout << " [ACTIVE]";
-            }
-            std::cout << "\n";
-            std::cout << "     GL: " << ButtonMappingToString(layout.glMapping)
-                      << " | GR: " << ButtonMappingToString(layout.grMapping) << "\n";
-        }
-
-        std::cout << "  " << (g_proControllerConfig.layouts.size() + 1) << ". [NEW]\n";
-        std::cout << "  0. Exit Management Window\n\n";
-        std::cout << "Enter number to edit layout: ";
-
-        std::string input;
-        std::getline(std::cin, input);
-
-        if (input.empty()) continue;
-
-        int choice = std::stoi(input);
-
-        if (choice == 0) {
-            SaveProControllerConfig(g_proControllerConfig);
-            std::cout << "Exiting layout management...\n";
-            break;
-        }
-        else if (choice == static_cast<int>(g_proControllerConfig.layouts.size() + 1)) {
-            // Create new layout
-            GLGRLayout newLayout;
-            std::cout << "\nEnter name for new layout: ";
-            std::getline(std::cin, newLayout.name);
-            if (newLayout.name.empty()) {
-                newLayout.name = "Layout " + std::to_string(g_proControllerConfig.layouts.size() + 1);
-            }
-            newLayout.glMapping = ButtonMapping::NONE;
-            newLayout.grMapping = ButtonMapping::NONE;
-
-            ConfigureLayout(newLayout);
-            g_proControllerConfig.layouts.push_back(newLayout);
-            SaveProControllerConfig(g_proControllerConfig);
-            std::cout << "\nNew layout added!\n";
-        }
-        else if (choice > 0 && choice <= static_cast<int>(g_proControllerConfig.layouts.size())) {
-            // Edit existing layout
-            size_t index = choice - 1;
-            std::cout << "\nEditing: " << g_proControllerConfig.layouts[index].name << "\n";
-            std::cout << "1. Rename layout\n";
-            std::cout << "2. Configure mappings\n";
-            std::cout << "3. Delete layout\n";
-            std::cout << "4. Set as active layout\n";
-            std::cout << "0. Cancel\n";
-            std::cout << "Choice: ";
-
-            std::string editChoice;
-            std::getline(std::cin, editChoice);
-
-            if (editChoice == "1") {
-                std::cout << "Enter new name: ";
-                std::string newName;
-                std::getline(std::cin, newName);
-                if (!newName.empty()) {
-                    g_proControllerConfig.layouts[index].name = newName;
-                    SaveProControllerConfig(g_proControllerConfig);
-                }
-            }
-            else if (editChoice == "2") {
-                ConfigureLayout(g_proControllerConfig.layouts[index]);
-                SaveProControllerConfig(g_proControllerConfig);
-            }
-            else if (editChoice == "3") {
-                if (g_proControllerConfig.layouts.size() > 1) {
-                    std::cout << "Are you sure you want to delete this layout? (y/n): ";
-                    std::string confirm;
-                    std::getline(std::cin, confirm);
-                    if (confirm == "y" || confirm == "Y") {
-                        g_proControllerConfig.layouts.erase(g_proControllerConfig.layouts.begin() + index);
-                        if (g_proControllerConfig.activeLayoutIndex >= static_cast<int>(g_proControllerConfig.layouts.size())) {
-                            g_proControllerConfig.activeLayoutIndex = static_cast<int>(g_proControllerConfig.layouts.size()) - 1;
-                        }
-                        SaveProControllerConfig(g_proControllerConfig);
-                        std::cout << "Layout deleted!\n";
-                    }
-                } else {
-                    std::cout << "Cannot delete the last layout!\n";
-                }
-            }
-            else if (editChoice == "4") {
-                g_proControllerConfig.activeLayoutIndex = static_cast<int>(index);
-                SaveProControllerConfig(g_proControllerConfig);
-                std::cout << "Active layout changed to: " << g_proControllerConfig.layouts[index].name << "\n";
-            }
-        }
-    }
-}
-
-// Apply ButtonMapping to DS4 report
-void ApplyButtonMapping(DS4_REPORT_EX& report, ButtonMapping mapping) {
-    switch (mapping) {
-        case ButtonMapping::L3:
-            report.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;
-            break;
-        case ButtonMapping::R3:
-            report.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;
-            break;
-        case ButtonMapping::L1:
-            report.Report.wButtons |= DS4_BUTTON_SHOULDER_LEFT;
-            break;
-        case ButtonMapping::R1:
-            report.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;
-            break;
-        case ButtonMapping::L2:
-            report.Report.bTriggerL = 255;
-            break;
-        case ButtonMapping::R2:
-            report.Report.bTriggerR = 255;
-            break;
-        case ButtonMapping::CROSS:
-            report.Report.wButtons |= DS4_BUTTON_CROSS;
-            break;
-        case ButtonMapping::CIRCLE:
-            report.Report.wButtons |= DS4_BUTTON_CIRCLE;
-            break;
-        case ButtonMapping::SQUARE:
-            report.Report.wButtons |= DS4_BUTTON_SQUARE;
-            break;
-        case ButtonMapping::TRIANGLE:
-            report.Report.wButtons |= DS4_BUTTON_TRIANGLE;
-            break;
-        case ButtonMapping::SHARE:
-            report.Report.wButtons |= DS4_BUTTON_SHARE;
-            break;
-        case ButtonMapping::OPTIONS:
-            report.Report.wButtons |= DS4_BUTTON_OPTIONS;
-            break;
-        case ButtonMapping::DPAD_UP:
-            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_NORTH);
-            break;
-        case ButtonMapping::DPAD_DOWN:
-            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_SOUTH);
-            break;
-        case ButtonMapping::DPAD_LEFT:
-            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_WEST);
-            break;
-        case ButtonMapping::DPAD_RIGHT:
-            DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_EAST);
-            break;
-        case ButtonMapping::NONE:
-        default:
-            // Do nothing
-            break;
-    }
-}
-
-// Send keyboard key press/release using Windows SendInput API
-void SendKeyboardInput(WORD virtualKey, bool keyDown) {
-    INPUT input = {};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wVk = virtualKey;
-    input.ki.dwFlags = keyDown ? 0 : KEYEVENTF_KEYUP;
-    input.ki.time = 0;
-    input.ki.dwExtraInfo = 0;
-
-    SendInput(1, &input, sizeof(INPUT));
-}
-
-// Track button states to avoid repeated key presses
-static bool g_screenshotButtonPressed = false;
-static bool g_cButtonPressed = false;
-static bool g_comboPressed = false;
-
-// Flag for ZL+ZR+GL+GR combo to enter management window
-static std::atomic<bool> g_openManagementWindow(false);
-
-// Handle special Pro Controller buttons (Screenshot, C button, and combo detection)
-void HandleSpecialProButtons(const std::vector<uint8_t>& buffer) {
-    if (buffer.size() < 9) return;
-
-    // Build button state from bytes 3-8
-    uint64_t state = 0;
-    for (int i = 3; i <= 8; ++i) {
-        state = (state << 8) | buffer[i];
-    }
-
-    constexpr uint64_t BUTTON_SCREENSHOT_MASK = 0x000020000000;  // Bit 29
-    constexpr uint64_t BUTTON_C_MASK = 0x000040000000;           // Bit 30
-    constexpr uint64_t BUTTON_GL_MASK = 0x000000000200;          // Bit 9
-    constexpr uint64_t BUTTON_GR_MASK = 0x000000000100;          // Bit 8
-    constexpr uint64_t TRIGGER_ZL_MASK = 0x000000800000;         // ZL trigger
-    constexpr uint64_t TRIGGER_ZR_MASK = 0x008000000000;         // ZR trigger
-
-    // Check for ZL+ZR+GL+GR combo to open management window (only trigger on initial press)
-    bool comboCurrentlyPressed = (state & TRIGGER_ZL_MASK) && (state & TRIGGER_ZR_MASK) &&
-                                  (state & BUTTON_GL_MASK) && (state & BUTTON_GR_MASK);
-
-    if (comboCurrentlyPressed && !g_comboPressed) {
-        // Combo just pressed - trigger management window
-        g_openManagementWindow.store(true);
-        g_comboPressed = true;
-    }
-    else if (!comboCurrentlyPressed && g_comboPressed) {
-        // Combo released - reset state
-        g_comboPressed = false;
-    }
-
-    // Handle Screenshot button -> F12 key
-    bool screenshotPressed = (state & BUTTON_SCREENSHOT_MASK) != 0;
-    if (screenshotPressed && !g_screenshotButtonPressed) {
-        // Button just pressed - send F12 key down
-        SendKeyboardInput(VK_F12, true);
-        g_screenshotButtonPressed = true;
-    }
-    else if (!screenshotPressed && g_screenshotButtonPressed) {
-        // Button just released - send F12 key up
-        SendKeyboardInput(VK_F12, false);
-        g_screenshotButtonPressed = false;
-    }
-
-    // Handle C button -> Cycle through layouts
-    bool cPressed = (state & BUTTON_C_MASK) != 0;
-    if (cPressed && !g_cButtonPressed) {
-        // Button just pressed - cycle to next layout
-        if (!g_proControllerConfig.layouts.empty()) {
-            int oldIndex = g_proControllerConfig.activeLayoutIndex;
-            g_proControllerConfig.activeLayoutIndex = (g_proControllerConfig.activeLayoutIndex + 1) % g_proControllerConfig.layouts.size();
-            SaveProControllerConfig(g_proControllerConfig);
-
-            // Log layout change
-            std::cout << "\n[Layout Changed] "
-                      << g_proControllerConfig.layouts[oldIndex].name
-                      << " -> "
-                      << g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].name
-                      << " (GL: " << ButtonMappingToString(g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].glMapping)
-                      << ", GR: " << ButtonMappingToString(g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].grMapping)
-                      << ")\n";
-        }
-        g_cButtonPressed = true;
-    }
-    else if (!cPressed && g_cButtonPressed) {
-        g_cButtonPressed = false;
-    }
-}
-
-// Apply GL/GR mappings to Pro Controller report using active layout
-void ApplyGLGRMappings(DS4_REPORT_EX& report, const std::vector<uint8_t>& buffer) {
-    if (buffer.size() < 9) return;
-
-    // Check if we have any layouts
-    if (g_proControllerConfig.layouts.empty()) return;
-
-    // Get the active layout
-    int layoutIndex = g_proControllerConfig.activeLayoutIndex;
-    if (layoutIndex < 0 || layoutIndex >= static_cast<int>(g_proControllerConfig.layouts.size())) {
-        layoutIndex = 0;
-        g_proControllerConfig.activeLayoutIndex = 0;
-    }
-
-    const GLGRLayout& activeLayout = g_proControllerConfig.layouts[layoutIndex];
-
-    // Build button state from bytes 3-8 (same as in JoyConDecoder)
-    uint64_t state = 0;
-    for (int i = 3; i <= 8; ++i) {
-        state = (state << 8) | buffer[i];
-    }
-
-    constexpr uint64_t BUTTON_GL_MASK = 0x000000000200;  // Bit 9
-    constexpr uint64_t BUTTON_GR_MASK = 0x000000000100;  // Bit 8
-
-    // Apply mappings if buttons are pressed
-    if (state & BUTTON_GL_MASK) {
-        ApplyButtonMapping(report, activeLayout.glMapping);
-    }
-    if (state & BUTTON_GR_MASK) {
-        ApplyButtonMapping(report, activeLayout.grMapping);
-    }
-}
-
-void SendCustomCommands(GattCharacteristic const& characteristic)
-{
-    std::vector<std::vector<uint8_t>> commands = {
-        { 0x0c, 0x91, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00 },
-        { 0x0c, 0x91, 0x01, 0x04, 0x00, 0x04, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00 }
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    g_proConfig.layouts.clear(); g_proConfig.activeLayoutIndex = 0;
+    auto readField = [&](const std::string& key) -> std::string {
+        auto p = json.find("\"" + key + "\"");
+        if (p == std::string::npos) return "";
+        auto c = json.find(':', p); auto e = json.find_first_of(",}\n", c);
+        auto v = json.substr(c+1, e-c-1);
+        v.erase(0, v.find_first_not_of(" \t\n\r\""));
+        v.erase(v.find_last_not_of(" \t\n\r\"")+1);
+        return v;
     };
-
-    for (const auto& cmd : commands)
-    {
-        auto writer = DataWriter();
-        writer.WriteBytes(cmd);
-        IBuffer buffer = writer.DetachBuffer();
-
-        auto status = characteristic.WriteValueAsync(buffer, GattWriteOption::WriteWithoutResponse).get();
-
-        if (status == GattCommunicationStatus::Success)
-        {
-            std::wcout << L"Command sent successfully.\n";
-        }
-        else
-        {
-            std::wcout << L"Failed to send command.\n";
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    try { g_proConfig.activeLayoutIndex = std::stoi(readField("activeLayoutIndex")); } catch(...) {}
+    size_t pos = json.find('[');
+    while (pos != std::string::npos) {
+        auto ob = json.find('{', pos);
+        if (ob == std::string::npos) break;
+        auto oe = json.find('}', ob);
+        if (oe == std::string::npos) break;
+        auto obj = json.substr(ob, oe-ob+1);
+        GLGRLayout lay;
+        auto getStr = [&](const std::string& key) -> std::string {
+            auto kp = obj.find("\""+key+"\"");
+            if (kp == std::string::npos) return "";
+            auto q1 = obj.find('"', kp+key.size()+2);
+            auto q2 = obj.find('"', q1+1);
+            return obj.substr(q1+1, q2-q1-1);
+        };
+        auto nm = getStr("name");
+        if (!nm.empty()) strncpy_s(lay.name, nm.c_str(), 63);
+        lay.glMapping = BtnMapFromStr(getStr("glMapping"));
+        lay.grMapping = BtnMapFromStr(getStr("grMapping"));
+        g_proConfig.layouts.push_back(lay);
+        pos = oe+1;
     }
+    if (g_proConfig.layouts.empty()) {
+        GLGRLayout def; g_proConfig.layouts.push_back(def); g_proConfig.activeLayoutIndex = 0;
+    }
+    if (g_proConfig.activeLayoutIndex < 0 || g_proConfig.activeLayoutIndex >= (int)g_proConfig.layouts.size())
+        g_proConfig.activeLayoutIndex = 0;
 }
-// Helper to send generic commands matching main.py structure
-void SendGenericCommand(GattCharacteristic const& characteristic, uint8_t cmdId, uint8_t subCmdId, const std::vector<uint8_t>& data) {
-    if (!characteristic) return;
 
-    DataWriter writer;
-    
-    // Structure: CmdID, 0x91, 0x01, SubCmdID, 0x00, Len, 0x00, 0x00, Data...
-    writer.WriteByte(cmdId);
-    writer.WriteByte(0x91);
-    writer.WriteByte(0x01);
-    writer.WriteByte(subCmdId);
-    writer.WriteByte(0x00);
-    writer.WriteByte(static_cast<uint8_t>(data.size()));
-    writer.WriteByte(0x00);
-    writer.WriteByte(0x00);
-    
-    // Write Data
-    for (uint8_t b : data) {
-        writer.WriteByte(b);
-    }
-
-    IBuffer buffer = writer.DetachBuffer();
-    characteristic.WriteValueAsync(buffer, GattWriteOption::WriteWithoutResponse).get();
-    
-    // Small delay to prevent flooding
+static void SendGenericCommand(GattCharacteristic const& ch, uint8_t cmdId, uint8_t subId, const std::vector<uint8_t>& data) {
+    if (!ch) return;
+    DataWriter w;
+    w.WriteByte(cmdId); w.WriteByte(0x91); w.WriteByte(0x01);
+    w.WriteByte(subId); w.WriteByte(0x00); w.WriteByte((uint8_t)data.size());
+    w.WriteByte(0x00); w.WriteByte(0x00);
+    for (auto b : data) w.WriteByte(b);
+    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse).get();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
-
-void EmitSound(GattCharacteristic const& characteristic) {
-    // CMD 0x0A, SUB 0x02, Data: 0x04 (Preset) + Padding (up to 8 bytes total)
-    std::vector<uint8_t> data(8, 0x00);
-    data[0] = 0x04; // Preset ID
-    SendGenericCommand(characteristic, 0x0A, 0x02, data);
+static void SetPlayerLEDs(GattCharacteristic const& ch, uint8_t pat) {
+    std::vector<uint8_t> d(8, 0); d[0] = pat;
+    SendGenericCommand(ch, 0x09, 0x07, d);
 }
-
-void SetPlayerLEDs(GattCharacteristic const& characteristic, uint8_t pattern) {
-    // CMD 0x09, SUB 0x07, Data: pattern + Padding (up to 8 bytes total)
-    std::vector<uint8_t> data(8, 0x00);
-    data[0] = pattern;
-    SendGenericCommand(characteristic, 0x09, 0x07, data);
+static void EmitSound(GattCharacteristic const& ch) {
+    std::vector<uint8_t> d(8, 0); d[0] = 0x04;
+    SendGenericCommand(ch, 0x0A, 0x02, d);
 }
-
-struct ConnectedJoyCon {
-    BluetoothLEDevice device = nullptr;
-    GattCharacteristic inputChar = nullptr;
-    GattCharacteristic writeChar = nullptr;
-};
-
-const wchar_t* GattStatusToString(GattCommunicationStatus status)
-{
-    switch (status) {
-        case GattCommunicationStatus::Success:
-            return L"Success";
-        case GattCommunicationStatus::Unreachable:
-            return L"Unreachable";
-        case GattCommunicationStatus::ProtocolError:
-            return L"ProtocolError";
-        case GattCommunicationStatus::AccessDenied:
-            return L"AccessDenied";
-        default:
-            return L"Unknown";
-    }
-}
-
-ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
-{
-    std::wcout << prompt << L"\n";
-
-    ConnectedJoyCon cj{};
-
-    BluetoothLEDevice device = nullptr;
-    bool connected = false;
-
-    BluetoothLEAdvertisementWatcher watcher;
-
-    std::mutex mtx;
-    std::condition_variable cv;
-
-    watcher.Received([&](auto const&, auto const& args)
-        {
-            std::unique_lock<std::mutex> lock(mtx);
-            if (connected) return;
-
-            auto mfg = args.Advertisement().ManufacturerData();
-            for (uint32_t i = 0; i < mfg.Size(); i++)
-            {
-                auto section = mfg.GetAt(i);
-                if (section.CompanyId() != JOYCON_MANUFACTURER_ID) continue;
-                auto reader = DataReader::FromBuffer(section.Data());
-                std::vector<uint8_t> data(reader.UnconsumedBufferLength());
-                reader.ReadBytes(data);
-                if (data.size() >= JOYCON_MANUFACTURER_PREFIX.size() &&
-                    std::equal(JOYCON_MANUFACTURER_PREFIX.begin(), JOYCON_MANUFACTURER_PREFIX.end(), data.begin()))
-                {
-                    device = BluetoothLEDevice::FromBluetoothAddressAsync(args.BluetoothAddress()).get();
-                    if (!device) return;
-
-                    connected = true;
-                    watcher.Stop();
-                    cv.notify_one();
-                    return;
-                }
-            }
-        });
-
-    watcher.ScanningMode(BluetoothLEScanningMode::Active);
-    watcher.Start();
-
-    std::wcout << L"Scanning for Joy-Con... (Waiting up to 30 seconds)\n";
-
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        if (!cv.wait_for(lock, std::chrono::seconds(30), [&]() { return connected; }))
-        {
-            watcher.Stop();
-            std::wcerr << L"Timeout: Joy-Con not found.\n";
-            exit(1);
-        }
-    }
-
-    cj.device = device;
-
-    GattDeviceServicesResult servicesResult = nullptr;
-    for (int attempt = 1; attempt <= 10; ++attempt) {
-        servicesResult = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
-        if (servicesResult.Status() == GattCommunicationStatus::Success) {
-            break;
-        }
-
-        std::wcerr << L"Failed to get GATT services (attempt " << attempt
-            << L"/10, status=" << GattStatusToString(servicesResult.Status()) << L"). Retrying...\n";
+static void SendCustomCommands(GattCharacteristic const& ch) {
+    std::vector<std::vector<uint8_t>> cmds = {
+        {0x0c,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0xFF,0x00,0x00,0x00},
+        {0x0c,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0xFF,0x00,0x00,0x00}
+    };
+    for (auto& cmd : cmds) {
+        DataWriter w; w.WriteBytes(cmd);
+        ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse).get();
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
+}
 
-    if (!servicesResult || servicesResult.Status() != GattCommunicationStatus::Success) {
-        std::wcerr << L"Failed to get GATT services. Remove the Joy-Con from Windows Bluetooth settings, turn it off, then pair it again.\n";
-        exit(1);
-    }
+static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> statusCb, bool& outSuccess) {
+    outSuccess = false;
+    ConnectedJoyCon cj{};
+    BluetoothLEDevice device = nullptr;
+    bool found = false;
+    BluetoothLEAdvertisementWatcher watcher;
+    std::mutex mtx; std::condition_variable cv;
 
-    for (auto service : servicesResult.Services())
+    watcher.Received([&](auto const&, auto const& args) {
+        std::unique_lock<std::mutex> lk(mtx);
+        if (found) return;
+        auto mfg = args.Advertisement().ManufacturerData();
+        for (uint32_t i = 0; i < mfg.Size(); i++) {
+            auto sec = mfg.GetAt(i);
+            if (sec.CompanyId() != JOYCON_MANUFACTURER_ID) continue;
+            auto rdr = DataReader::FromBuffer(sec.Data());
+            std::vector<uint8_t> d(rdr.UnconsumedBufferLength());
+            rdr.ReadBytes(d);
+            if (d.size() >= JOYCON_MANUFACTURER_PREFIX.size() &&
+                std::equal(JOYCON_MANUFACTURER_PREFIX.begin(), JOYCON_MANUFACTURER_PREFIX.end(), d.begin())) {
+                device = BluetoothLEDevice::FromBluetoothAddressAsync(args.BluetoothAddress()).get();
+                if (!device) return;
+                found = true; watcher.Stop(); cv.notify_one();
+            }
+        }
+    });
+    watcher.ScanningMode(BluetoothLEScanningMode::Active);
+    watcher.Start();
+    statusCb("Scanning... (hold sync button)");
     {
-        auto charsResult = service.GetCharacteristicsAsync().get();
-        if (charsResult.Status() != GattCommunicationStatus::Success) continue;
-        for (auto characteristic : charsResult.Characteristics())
-        {
-            if (characteristic.Uuid() == guid(INPUT_REPORT_UUID))
-                cj.inputChar = characteristic;
-            else if (characteristic.Uuid() == guid(WRITE_COMMAND_UUID))
-                cj.writeChar = characteristic;
+        std::unique_lock<std::mutex> lk(mtx);
+        if (!cv.wait_for(lk, std::chrono::seconds(30), [&]{ return found; })) {
+            watcher.Stop();
+            statusCb("Timed out — device not found");
+            return cj;
         }
     }
-
-    if (!cj.inputChar || !cj.writeChar) {
-        std::wcerr << L"Joy-Con connected, but required GATT characteristics were not found.\n";
-        std::wcerr << L"Try removing the device from Windows Bluetooth settings and pairing it again.\n";
-        exit(1);
+    statusCb("Device found, fetching GATT services...");
+    cj.device = device;
+    GattDeviceServicesResult sr = nullptr;
+    for (int att = 1; att <= 10; ++att) {
+        sr = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
+        if (sr.Status() == GattCommunicationStatus::Success) break;
+        statusCb("Retrying GATT (" + std::to_string(att) + "/10)...");
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-
+    if (!sr || sr.Status() != GattCommunicationStatus::Success) {
+        statusCb("Failed to get GATT services. Re-pair the device.");
+        return cj;
+    }
+    for (auto svc : sr.Services()) {
+        auto cr = svc.GetCharacteristicsAsync().get();
+        if (cr.Status() != GattCommunicationStatus::Success) continue;
+        for (auto ch : cr.Characteristics()) {
+            if (ch.Uuid() == guid(INPUT_REPORT_UUID))  cj.inputChar = ch;
+            if (ch.Uuid() == guid(WRITE_COMMAND_UUID)) cj.writeChar = ch;
+        }
+    }
+    if (!cj.inputChar || !cj.writeChar) {
+        statusCb("Required GATT characteristics not found. Re-pair.");
+        return cj;
+    }
+    try {
+        cj.device.RequestPreferredConnectionParameters(BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
+    } catch(...) {}
+    outSuccess = true;
+    statusCb("Connected!");
     return cj;
 }
 
-enum ControllerType {
-    SingleJoyCon = 1,
-    DualJoyCon = 2,
-    ProController = 3,
-    NSOGCController = 4
-};
-
-struct PlayerConfig {
-    ControllerType controllerType;
-    JoyConSide joyconSide;
-    JoyConOrientation joyconOrientation;
-    GyroSource gyroSource;
-    GyroMode gyroMode;
-    MotionProfile motionProfile;
-};
-
-// For single Joy-Con players, store controller + JoyCon info to keep alive
-struct SingleJoyConPlayer {
-    ConnectedJoyCon joycon;
-    PVIGEM_TARGET ds4Controller;
-    JoyConSide side;
-    JoyConOrientation orientation;
-    
-    // Mouse State
-    int mouseMode = 0; // 0=Off, 1=Fast, 2=Normal, 3=Slow
-    bool wasChatPressed = false;
-    int16_t lastOpticalX = 0;
-    int16_t lastOpticalY = 0;
-    bool firstOpticalRead = true;
-    
-    // Scroll Accumulator
-    float scrollAccumulator = 0.0f;
-    
-    // Button States for Edge Detection (to avoid rapid fire)
-    bool mb4Pressed = false;
-    bool mb5Pressed = false;
-    
-    // Previous button states for click emulation
-    bool leftBtnPressed = false;
-    bool rightBtnPressed = false;
-    bool middleBtnPressed = false;
-
-    LatencyTracker latency;
-};
-
-struct TimedInputBuffer {
-    std::vector<uint8_t> buffer;
-    TimePoint receivedAt{};
-    double bleDeltaMs = -1.0;
-    uint64_t sequence = 0;
-};
-
-struct DualJoyConSharedState {
-    std::mutex mutex;
-    std::condition_variable cv;
-    TimedInputBuffer left;
-    TimedInputBuffer right;
-    TimePoint lastLeftBleTime{};
-    TimePoint lastRightBleTime{};
-    TimePoint lastEmitTime{};
-    uint64_t sequence = 0;
-    uint64_t eventIndex = 0;
-};
-
-// For dual Joy-Con players, store both JoyCons, controller, thread, and running flag
-struct DualJoyConPlayer {
-    ConnectedJoyCon leftJoyCon;
-    ConnectedJoyCon rightJoyCon;
-    GyroSource gyroSource;
-    GyroMode gyroMode;
-    MotionProfile motionProfile;
-    uint8_t dsuSlot = 0;
-    PVIGEM_TARGET ds4Controller;
-    std::atomic<bool> running;
-    std::thread updateThread;
-    std::shared_ptr<DualJoyConSharedState> sharedState;
-};
-
-// For Pro Controller players
-struct ProControllerPlayer {
-    ConnectedJoyCon controller;
-    PVIGEM_TARGET ds4Controller;
-    LatencyTracker latency;
-};
-
-int main(int argc, char* argv[])
-{
-    init_apartment();
-
-    for (int arg = 1; arg < argc; ++arg) {
-        const std::string option = argv[arg];
-        if (option == "--latency-test" || option == "--latency-benchmark") {
-            g_runtimeOptions.latencyMetrics = true;
-        }
-        else if (option == "--update-policy" && arg + 1 < argc) {
-            const std::string value = argv[++arg];
-            if (value == "low" || value == "LowLatency") {
-                g_runtimeOptions.updatePolicy = UpdatePolicy::LowLatency;
-            }
-            else if (value == "balanced" || value == "Balanced120Hz") {
-                g_runtimeOptions.updatePolicy = UpdatePolicy::Balanced120Hz;
-            }
-            else if (value == "legacy" || value == "Legacy60Hz") {
-                g_runtimeOptions.updatePolicy = UpdatePolicy::Legacy60Hz;
-            }
-        }
-        else if (option == "--latency-csv" && arg + 1 < argc) {
-            g_runtimeOptions.latencyCsvPath = argv[++arg];
-        }
+static void InitViGEm() {
+    if (g_vigem) return;
+    g_vigem = vigem_alloc();
+    if (!g_vigem || !VIGEM_SUCCESS(vigem_connect(g_vigem))) {
+        AppLog("[ERROR] ViGEm failed to connect");
     }
+}
+static PVIGEM_TARGET AddDS4() {
+    auto t = vigem_target_ds4_alloc();
+    vigem_target_set_vid(t, 0x054C);
+    vigem_target_set_pid(t, 0x09CC);
+    vigem_target_add(g_vigem, t);
+    return t;
+}
 
-    std::wstring metricsLine;
-    std::wcout << L"Enable latency metrics? (y/N): ";
-    std::getline(std::wcin, metricsLine);
-    if (metricsLine == L"y" || metricsLine == L"Y") {
-        g_runtimeOptions.latencyMetrics = true;
+static void ApplyBtnMapping(DS4_REPORT_EX& r, ButtonMapping m) {
+    switch(m) {
+        case ButtonMapping::L3:       r.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;    break;
+        case ButtonMapping::R3:       r.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;   break;
+        case ButtonMapping::L1:       r.Report.wButtons |= DS4_BUTTON_SHOULDER_LEFT; break;
+        case ButtonMapping::R1:       r.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;break;
+        case ButtonMapping::L2:       r.Report.bTriggerL = 255;                      break;
+        case ButtonMapping::R2:       r.Report.bTriggerR = 255;                      break;
+        case ButtonMapping::CROSS:    r.Report.wButtons |= DS4_BUTTON_CROSS;         break;
+        case ButtonMapping::CIRCLE:   r.Report.wButtons |= DS4_BUTTON_CIRCLE;        break;
+        case ButtonMapping::SQUARE:   r.Report.wButtons |= DS4_BUTTON_SQUARE;        break;
+        case ButtonMapping::TRIANGLE: r.Report.wButtons |= DS4_BUTTON_TRIANGLE;      break;
+        case ButtonMapping::SHARE:    r.Report.wButtons |= DS4_BUTTON_SHARE;         break;
+        case ButtonMapping::OPTIONS:  r.Report.wButtons |= DS4_BUTTON_OPTIONS;       break;
+        case ButtonMapping::DPAD_UP:    DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_NORTH); break;
+        case ButtonMapping::DPAD_DOWN:  DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_SOUTH); break;
+        case ButtonMapping::DPAD_LEFT:  DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_WEST);  break;
+        case ButtonMapping::DPAD_RIGHT: DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_EAST);  break;
+        default: break;
     }
+}
+static void ApplyGLGR(DS4_REPORT_EX& r, const std::vector<uint8_t>& buf) {
+    if (buf.size() < 9 || g_proConfig.layouts.empty()) return;
+    int li = g_proConfig.activeLayoutIndex;
+    if (li < 0 || li >= (int)g_proConfig.layouts.size()) li = 0;
+    auto& lay = g_proConfig.layouts[li];
+    uint64_t st = 0;
+    for (int i = 3; i <= 8; ++i) st = (st << 8) | buf[i];
+    if (st & 0x000000000200ULL) ApplyBtnMapping(r, lay.glMapping);
+    if (st & 0x000000000100ULL) ApplyBtnMapping(r, lay.grMapping);
+}
+static void HandleSpecialProButtons(const std::vector<uint8_t>& buf) {
+    if (buf.size() < 9) return;
+    uint64_t st = 0;
+    for (int i = 3; i <= 8; ++i) st = (st << 8) | buf[i];
+    constexpr uint64_t SCREENSHOT = 0x000020000000;
+    constexpr uint64_t CBTN       = 0x000040000000;
+    constexpr uint64_t GL         = 0x000000000200;
+    constexpr uint64_t GR         = 0x000000000100;
+    constexpr uint64_t ZL         = 0x000000800000;
+    constexpr uint64_t ZR         = 0x008000000000;
 
-    std::wstring policyLine;
-    std::wcout << L"Update policy? (1=LowLatency, 2=Balanced120Hz, 3=Legacy60Hz) [1]: ";
-    std::getline(std::wcin, policyLine);
-    if (policyLine == L"2") {
-        g_runtimeOptions.updatePolicy = UpdatePolicy::Balanced120Hz;
+    bool combo = (st & ZL) && (st & ZR) && (st & GL) && (st & GR);
+    if (combo && !g_comboPressed) { g_openLayoutManager.store(true); g_comboPressed = true; }
+    else if (!combo) g_comboPressed = false;
+
+    bool screenshot = (st & SCREENSHOT) != 0;
+    if (screenshot && !g_screenshotButtonPressed) { INPUT ip{}; ip.type=INPUT_KEYBOARD; ip.ki.wVk=VK_F12; SendInput(1,&ip,sizeof(ip)); g_screenshotButtonPressed=true; }
+    else if (!screenshot && g_screenshotButtonPressed) { INPUT ip{}; ip.type=INPUT_KEYBOARD; ip.ki.wVk=VK_F12; ip.ki.dwFlags=KEYEVENTF_KEYUP; SendInput(1,&ip,sizeof(ip)); g_screenshotButtonPressed=false; }
+
+    bool cBtn = (st & CBTN) != 0;
+    if (cBtn && !g_cButtonPressed) {
+        if (!g_proConfig.layouts.empty()) {
+            g_proConfig.activeLayoutIndex = (g_proConfig.activeLayoutIndex + 1) % (int)g_proConfig.layouts.size();
+            SaveProConfig();
+            AppLog(std::string("Layout -> ") + g_proConfig.layouts[g_proConfig.activeLayoutIndex].name);
+        }
+        g_cButtonPressed = true;
+    } else if (!cBtn) g_cButtonPressed = false;
+}
+
+static void SendKey(WORD vk, bool down) {
+    INPUT ip{}; ip.type=INPUT_KEYBOARD; ip.ki.wVk=vk;
+    ip.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    SendInput(1, &ip, sizeof(ip));
+}
+
+struct CalibWizard {
+    bool active   = false;
+    int  step     = 0;
+    bool isLeft   = true;
+    int rawX = 2048, rawY = 2048;
+    int centerX = 2048, centerY = 2048;
+    int minX = 4095, maxX = 0, minY = 4095, maxY = 0;
+    bool capturing = false;
+    int  captureFrames = 0;
+    std::vector<uint8_t> lastBuf;
+};
+static CalibWizard  g_calib;
+static std::mutex   g_calibBufMutex;
+
+static void ResetCalib(bool isLeft) {
+    g_calib.active        = true;
+    g_calib.step          = 0;
+    g_calib.isLeft        = isLeft;
+    g_calib.rawX          = 2048;
+    g_calib.rawY          = 2048;
+    g_calib.centerX       = 2048;
+    g_calib.centerY       = 2048;
+    g_calib.minX          = 4095;
+    g_calib.maxX          = 0;
+    g_calib.minY          = 4095;
+    g_calib.maxY          = 0;
+    g_calib.capturing     = false;
+    g_calib.captureFrames = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_calibBufMutex);
+        g_calib.lastBuf.clear();
     }
-    else if (policyLine == L"3") {
-        g_runtimeOptions.updatePolicy = UpdatePolicy::Legacy60Hz;
+}
+
+static void FeedCalibBuffer(const std::vector<uint8_t>& buf, bool isLeftSide) {
+    if (!g_calib.active) return;
+    if (g_calib.isLeft != isLeftSide) return;
+    std::lock_guard<std::mutex> lk(g_calibBufMutex);
+    g_calib.lastBuf = buf;
+}
+
+static void UpdateCalibLiveValues() {
+    std::lock_guard<std::mutex> lk(g_calibBufMutex);
+    if (g_calib.lastBuf.size() < 16) return;
+    ExtractRawStick(g_calib.lastBuf, g_calib.isLeft, g_calib.rawX, g_calib.rawY);
+    if (g_calib.capturing) {
+        g_calib.minX = std::min(g_calib.minX, g_calib.rawX);
+        g_calib.maxX = std::max(g_calib.maxX, g_calib.rawX);
+        g_calib.minY = std::min(g_calib.minY, g_calib.rawY);
+        g_calib.maxY = std::max(g_calib.maxY, g_calib.rawY);
+        ++g_calib.captureFrames;
     }
+}
 
-    if (g_runtimeOptions.latencyMetrics) {
-        if (g_latencyLogger.Start(g_runtimeOptions.latencyCsvPath)) {
-            const std::wstring csvPath(g_runtimeOptions.latencyCsvPath.begin(), g_runtimeOptions.latencyCsvPath.end());
-            std::wcout << L"Latency metrics enabled: " << csvPath << L"\n";
-        }
-        else {
-            std::wcerr << L"Warning: could not open latency CSV. Metrics disabled.\n";
-        }
-    }
-    const std::string policyName = UpdatePolicyName(g_runtimeOptions.updatePolicy);
-    std::wcout << L"Update policy: " << std::wstring(policyName.begin(), policyName.end()) << L"\n";
+static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroMode, MotionProfile motionProfile, uint8_t dsuSlot) {
+    player.joycon.inputChar.ValueChanged(
+        [&player, gyroMode, motionProfile, dsuSlot]
+        (GattCharacteristic const&, GattValueChangedEventArgs const& args)
+    {
+        const auto now = SteadyClock::now();
+        auto rdr = DataReader::FromBuffer(args.CharacteristicValue());
+        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
+        rdr.ReadBytes(buf);
 
-    int numPlayers;
-    std::wcout << L"How many players? ";
-    std::wcin >> numPlayers;
-    std::wcin.ignore();
+        FeedCalibBuffer(buf, player.side == JoyConSide::Left);
 
-    std::vector<PlayerConfig> playerConfigs;
+        const double bleDelta = MsBetween(player.latency.lastBleTime, now);
+        player.latency.lastBleTime = now;
 
-    for (int i = 0; i < numPlayers; ++i) {
-        PlayerConfig config{};
-        std::wstring line;
-
-        while (true) {
-            std::wcout << L"Player " << (i + 1) << L":\n";
-            std::wcout << L"  What controller type? (1=Single JoyCon, 2=Dual JoyCon, 3=Pro Controller, 4=NSO GC Controller): ";
-            std::getline(std::wcin, line);
-            if (line == L"1" || line == L"2" || line == L"3" || line == L"4") {
-                config.controllerType = static_cast<ControllerType>(std::stoi(std::string(line.begin(), line.end())));
-                break;
-            }
-            std::wcout << L"Invalid input. Please enter 1, 2, or 3.\n";
-        }
-
-        if (config.controllerType == SingleJoyCon) {
-            while (true) {
-                std::wcout << L"  Which side? (L=Left, R=Right): ";
-                std::getline(std::wcin, line);
-                if (line == L"L" || line == L"R" || line == L"l" || line == L"r") {
-                    config.joyconSide = (line == L"L" || line == L"l") ? JoyConSide::Left : JoyConSide::Right;
-                    break;
-                }
-                std::wcout << L"Invalid input. Please enter L or R.\n";
-            }
-            while (true) {
-                std::wcout << L"  What orientation? (U=Upright, S=Sideways): ";
-                std::getline(std::wcin, line);
-                if (line == L"U" || line == L"S" || line == L"u" || line == L"s") {
-                    config.joyconOrientation = (line == L"S" || line == L"s") ? JoyConOrientation::Sideways : JoyConOrientation::Upright;
-                    break;
-                }
-                std::wcout << L"Invalid input. Please enter U or S.\n";
-            }
-        }
-        else if (config.controllerType == DualJoyCon) {
-            config.joyconSide = JoyConSide::Left;
-            config.joyconOrientation = JoyConOrientation::Upright;
-
-            while (true) {
-                std::wcout << L"Player " << (i + 1) << L":\n";
-                std::wcout << L"  What should be used as Gyro Source? (B=Both JoyCons, L=Left JoyCon, R=Right JoyCon): ";
-                std::getline(std::wcin, line);
-
-                if (line == L"B") {
-                    config.gyroSource = GyroSource::Both;
-                    break;
-                }
-                else if (line == L"L") {
-                    config.gyroSource = GyroSource::Left;
-                    break;
-                }
-                else if (line == L"R") {
-                    config.gyroSource = GyroSource::Right;
-                    break;
-                }
-                std::wcout << L"Invalid input. Please enter B, L, or R.\n";
-            }
-
-        }
-
-        if (config.controllerType == SingleJoyCon || config.controllerType == DualJoyCon || config.controllerType == ProController) {
-            while (true) {
-                std::wcout << L"  Gyro output? (1=DS4 Raw, 2=DS4 Switch Emulator, 3=DSU UDP): ";
-                std::getline(std::wcin, line);
-                if (line == L"1" || line.empty()) {
-                    config.gyroMode = GyroMode::DS4Raw;
-                    config.motionProfile = MotionProfile::Raw;
-                    break;
-                }
-                if (line == L"2") {
-                    config.gyroMode = GyroMode::DS4SwitchEmu;
-                    config.motionProfile = MotionProfile::SwitchEmu;
-                    break;
-                }
-                if (line == L"3") {
-                    config.gyroMode = GyroMode::DsuUdp;
-                    config.motionProfile = MotionProfile::SwitchEmu;
-                    std::wcout << L"  Configure your emulator's Cemuhook/DSU motion source at 127.0.0.1:26760.\n";
-                    if (config.controllerType == DualJoyCon && config.gyroSource == GyroSource::Both) {
-                        std::wcout << L"  Tip: choose Right as gyro source for pointer/sword motion when using the right Joy-Con.\n";
-                    }
-                    break;
-                }
-                std::wcout << L"Invalid input. Please enter 1, 2, or 3.\n";
-            }
-        }
-        else {
-            config.gyroMode = GyroMode::DS4Raw;
-            config.motionProfile = MotionProfile::Raw;
-        }
-
-        playerConfigs.push_back(config);
-    }
-
-    DsuServer dsuServer;
-    const bool needsDsu = std::any_of(playerConfigs.begin(), playerConfigs.end(), [](const PlayerConfig& config) {
-        return config.gyroMode == GyroMode::DsuUdp;
-    });
-    if (needsDsu) {
-        if (dsuServer.Start()) {
-            std::wcout << L"DSU UDP server listening on 127.0.0.1:26760.\n";
-        }
-        else {
-            std::wcerr << L"Failed to start DSU UDP server on 127.0.0.1:26760.\n";
-        }
-    }
-
-    InitializeViGEm();
-
-    // Store all players to keep them alive
-    std::vector<SingleJoyConPlayer> singlePlayers;
-    std::vector<std::unique_ptr<DualJoyConPlayer>> dualPlayers;
-    std::vector<ProControllerPlayer> proPlayers;
-    singlePlayers.reserve(numPlayers);
-    dualPlayers.reserve(numPlayers);
-    proPlayers.reserve(numPlayers);
-
-    for (int i = 0; i < numPlayers; ++i) {
-        auto& config = playerConfigs[i];
-        std::wcout << L"Player " << (i + 1) << L" setup...\n";
-
-        if (config.controllerType == SingleJoyCon) {
-            std::wstring sideStr = (config.joyconSide == JoyConSide::Left) ? L"Left" : L"Right";
-            std::wcout << L"Please sync your single Joy-Con (" << sideStr << L") now.\n";
-
-            ConnectedJoyCon cj = WaitForJoyCon(L"Waiting for single Joy-Con...");
-
-            // Request minimum BLE connection interval for lowest latency
-            try {
-                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
-                cj.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency (Windows may ignore this request).\n";
-            }
-            catch (...) {
-                std::wcout << L"Warning: Could not request preferred connection parameters.\n";
-            }
-
-            PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
-            auto ret = vigem_target_add(vigem_client, ds4_controller);
-            if (!VIGEM_SUCCESS(ret))
-            {
-                std::wcerr << L"Failed to add DS4 controller target: 0x" << std::hex << ret << L"\n";
-                exit(1);
-            }
-
-            singlePlayers.push_back({ cj, ds4_controller, config.joyconSide, config.joyconOrientation });
-            auto& player = singlePlayers.back();
-
-            if (config.gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
-                dsuServer.SetControllerConnected(static_cast<uint8_t>(i));
-            }
-
-            player.joycon.inputChar.ValueChanged([joyconSide = player.side, joyconOrientation = player.orientation, &player, motionProfile = config.motionProfile, gyroMode = config.gyroMode, dsuSlot = static_cast<uint8_t>(i), &dsuServer](GattCharacteristic const&, GattValueChangedEventArgs const& args)
-                {
-                    const auto notificationReceived = SteadyClock::now();
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(buffer);
-                    const double bleDeltaMs = MillisecondsBetween(player.latency.lastBleTime, notificationReceived);
-                    player.latency.lastBleTime = notificationReceived;
-
-                    // Optical Mouse Toggle Logic (Only for Right Joy-Con/Joy-Con 2)
-                    if (joyconSide == JoyConSide::Right) {
-                        uint32_t btnState = ExtractButtonState(buffer);
-                        // CHAT button mask 0x000040 (Right JoyCon)
-                        bool chatPressed = (btnState & 0x000040) != 0;
-
-                        if (chatPressed && !player.wasChatPressed) {
-                            player.mouseMode = (player.mouseMode + 1) % 4;
-                            const char* modeName = "OFF";
-                            uint8_t ledPattern = 0x01; // Default OFF = LED 1
-                            if (player.mouseMode == 1) {
-                                modeName = "FAST";
-                                ledPattern = 0x02; // LED 2
-                            }
-                            else if (player.mouseMode == 2) {
-                                modeName = "NORMAL";
-                                ledPattern = 0x04; // LED 3
-                            }
-                            else if (player.mouseMode == 3) {
-                                modeName = "SLOW";
-                                ledPattern = 0x08; // LED 4
-                            }
-                            
-                            std::cout << "Optical Mouse Mode: " << modeName << std::endl;
-                            SetPlayerLEDs(player.joycon.writeChar, ledPattern);
-                            EmitSound(player.joycon.writeChar);
-                        }
-                        player.wasChatPressed = chatPressed;
-                        
-                        // If Mouse Mode is ON (1, 2, or 3)
-                        if (player.mouseMode > 0) {
-                            // --- 1. Optical Mouse Movement ---
-                            auto [rawX, rawY] = GetRawOpticalMouse(buffer);
-                            if (player.firstOpticalRead) {
-                                player.lastOpticalX = rawX;
-                                player.lastOpticalY = rawY;
-                                player.firstOpticalRead = false;
-                            } else {
-                                int16_t dx = rawX - player.lastOpticalX;
-                                int16_t dy = rawY - player.lastOpticalY;
-                                player.lastOpticalX = rawX;
-                                player.lastOpticalY = rawY;
-
-                                if (dx != 0 || dy != 0) {
-                                    float sensitivity = 1.0f;
-                                    if (player.mouseMode == 1) sensitivity = 1.0f;      // TODO: Fast 可调
-                                    else if (player.mouseMode == 2) sensitivity = 0.6f; // TODO: Normal 可调
-                                    else if (player.mouseMode == 3) sensitivity = 0.3f; // TODO: Slow 可调
-                                    
-                                    int moveX = static_cast<int>(dx * sensitivity);
-                                    int moveY = static_cast<int>(dy * sensitivity);
-                                    
-                                    INPUT input = {};
-                                    input.type = INPUT_MOUSE;
-                                    input.mi.dx = moveX;
-                                    input.mi.dy = moveY;
-                                    input.mi.dwFlags = MOUSEEVENTF_MOVE;
-                                    SendInput(1, &input, sizeof(INPUT));
-                                }
-                            }
-                            
-                            // --- 2. Mouse Buttons (R=Left, ZR=Right, Stick=Middle) ---
-                            // R = 0x004000, ZR = 0x008000, Stick = 0x000004
-                            bool rPressed = (btnState & 0x004000) != 0;
-                            bool zrPressed = (btnState & 0x008000) != 0;
-                            bool stickPressed = (btnState & 0x000004) != 0;
-                            
-                            // Left Click (R)
-                            if (rPressed && !player.leftBtnPressed) {
-                                INPUT input = {}; input.type = INPUT_MOUSE; input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN; SendInput(1, &input, sizeof(INPUT));
-                            } else if (!rPressed && player.leftBtnPressed) {
-                                INPUT input = {}; input.type = INPUT_MOUSE; input.mi.dwFlags = MOUSEEVENTF_LEFTUP; SendInput(1, &input, sizeof(INPUT));
-                            }
-                            player.leftBtnPressed = rPressed;
-                            
-                            // Right Click (ZR)
-                            if (zrPressed && !player.rightBtnPressed) {
-                                INPUT input = {}; input.type = INPUT_MOUSE; input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; SendInput(1, &input, sizeof(INPUT));
-                            } else if (!zrPressed && player.rightBtnPressed) {
-                                INPUT input = {}; input.type = INPUT_MOUSE; input.mi.dwFlags = MOUSEEVENTF_RIGHTUP; SendInput(1, &input, sizeof(INPUT));
-                            }
-                            player.rightBtnPressed = zrPressed;
-                            
-                            // Middle Click (Stick)
-                            if (stickPressed && !player.middleBtnPressed) {
-                                INPUT input = {}; input.type = INPUT_MOUSE; input.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; SendInput(1, &input, sizeof(INPUT));
-                            } else if (!stickPressed && player.middleBtnPressed) {
-                                INPUT input = {}; input.type = INPUT_MOUSE; input.mi.dwFlags = MOUSEEVENTF_MIDDLEUP; SendInput(1, &input, sizeof(INPUT));
-                            }
-                            player.middleBtnPressed = stickPressed;
-                            
-                            // --- 3. Stick Scrolling & Side Buttons ---
-                            auto stickData = DecodeJoystick(buffer, joyconSide, joyconOrientation);
-                            
-                            // Scroll (Vertical Stick)
-                            // stickData.y is normalized int16 (-32767 to 32767).
-                            // Up is typically negative Y in raw data?, DecodeJoystick returns standard cartesian?
-                            // Let's check testapp logic: outY = -y * 32767. If y was (y_raw - 2048), then raw 4095 (down) -> +y -> outY negative.
-                            // So DecodeJoystick: Up (+y_raw?) -> outY Positive?
-                            // Let's assume standard behavior: Up is Positive Y, Down is Negative Y in stickData (based on math).
-                            // Windows Wheel: +Delta is Up, -Delta is Down.
-                            
-                            // Let's try: Stick Up -> Scroll Up.
-                            // If stickData.y > deadzone -> Scroll Up.
-                            // Speed proportional to magnitude.
-                            
-                            const int SCROLL_DEADZONE = 4000;
-                            if (abs(stickData.y) > SCROLL_DEADZONE) {
-                                // Accumulate scroll
-                                float intensity = (abs(stickData.y) - SCROLL_DEADZONE) / (32767.0f - SCROLL_DEADZONE);
-                                float speed = intensity * 40.0f; // Max scroll per frame // TODO: 滚轮速度可调
-                                if (stickData.y > 0) player.scrollAccumulator -= speed; // Up
-                                else player.scrollAccumulator += speed; // Down
-                                
-                                if (abs(player.scrollAccumulator) >= 120.0f) {
-                                    int clicks = static_cast<int>(player.scrollAccumulator / 120.0f);
-                                    player.scrollAccumulator -= (clicks * 120.0f);
-                                    
-                                    INPUT input = {};
-                                    input.type = INPUT_MOUSE;
-                                    input.mi.mouseData = clicks * 120;
-                                    input.mi.dwFlags = MOUSEEVENTF_WHEEL;
-                                    SendInput(1, &input, sizeof(INPUT));
-                                }
-                            } else {
-                                player.scrollAccumulator = 0.0f;
-                            }
-                            
-                            // Side Buttons (Horizontal Stick)
-                            // Left Peak -> Back (MB4)
-                            // Right Peak -> Forward (MB5)
-                            const int BUTTON_THRESHOLD = 28000; // Near edge
-                            
-                            // MB4 (Back) - Left
-                            if (stickData.x < -BUTTON_THRESHOLD) {
-                                if (!player.mb4Pressed) {
-                                    INPUT input = {}; input.type = INPUT_MOUSE; input.mi.mouseData = XBUTTON1; input.mi.dwFlags = MOUSEEVENTF_XDOWN; SendInput(1, &input, sizeof(INPUT));
-                                    INPUT input2 = {}; input2.type = INPUT_MOUSE; input2.mi.mouseData = XBUTTON1; input2.mi.dwFlags = MOUSEEVENTF_XUP; SendInput(1, &input2, sizeof(INPUT));
-                                    player.mb4Pressed = true;
-                                }
-                            } else {
-                                player.mb4Pressed = false;
-                            }
-                            
-                            // MB5 (Forward) - Right
-                            if (stickData.x > BUTTON_THRESHOLD) {
-                                if (!player.mb5Pressed) {
-                                    INPUT input = {}; input.type = INPUT_MOUSE; input.mi.mouseData = XBUTTON2; input.mi.dwFlags = MOUSEEVENTF_XDOWN; SendInput(1, &input, sizeof(INPUT));
-                                    INPUT input2 = {}; input2.type = INPUT_MOUSE; input2.mi.mouseData = XBUTTON2; input2.mi.dwFlags = MOUSEEVENTF_XUP; SendInput(1, &input2, sizeof(INPUT));
-                                    player.mb5Pressed = true;
-                                }
-                            } else {
-                                player.mb5Pressed = false;
-                            }
-                            
-                            // --- 4. Suppress Inputs in DS4 Report ---
-                            // Modify buffer to clear mapped buttons so they don't trigger game actions
-                            // R (Byte 3, bit 6: 0x40), ZR (Byte 4, bit 7: 0x80 ... wait, let's check masks)
-                            
-                            // Button masks again:
-                            // R: 0x004000 -> Byte 3 & 0x40.
-                            // ZR: 0x008000 -> Byte 4 & 0x80 (Wait, 0x008000 is 3rd byte of 24-bit? 3,4,5. 0x004000 is 0x40 << 8? No)
-                            // ExtractButtonState: (buffer[3] << 16) | (buffer[4] << 8) | buffer[5]
-                            // 0x004000 = Bit 14 set.
-                            // buffer[3] is bits 23-16. buffer[4] is 15-8. buffer[5] is 7-0.
-                            // 0x4000 is in buffer[4] (0x40 << 8).
-                            // 0x8000 is in buffer[4] (0x80 << 8).
-                            // Stick Click 0x04 is in buffer[5].
-                            
-                            // So:
-                            // Clear R bit (0x40 in buffer[4])
-                            buffer[4] &= ~0x40;
-                            // Clear ZR bit (0x80 in buffer[4])
-                            buffer[4] &= ~0x80;
-                            // Clear Stick Click (0x04 in buffer[5])
-                            buffer[5] &= ~0x04;
-                            
-                            // Clear Stick Data (Set to center)
-                            // Right stick bytes: 13, 14, 15
-                            if (buffer.size() >= 16) {
-                                buffer[13] = 0x00;
-                                buffer[14] = 0x08;
-                                buffer[15] = 0x80;
-                            }
-                        } else {
-                            // Mode Off: Reset first reads
-                            player.firstOpticalRead = true;
-                        }
-                    }
-
-                    if (!ShouldEmitForPolicy(g_runtimeOptions.updatePolicy, player.latency.lastEmitTime, SteadyClock::now())) {
-                        return;
-                    }
-
-                    const auto decodeStart = SteadyClock::now();
-                    const MotionProfile ds4Profile = (gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
-                    DS4_REPORT_EX report = GenerateDS4Report(buffer, joyconSide, joyconOrientation, ds4Profile);
-
-                    if (gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
-                        DS4_REPORT_EX dsuReport = GenerateDS4Report(buffer, joyconSide, joyconOrientation, MotionProfile::SwitchEmu);
-                        dsuServer.UpdateController(dsuSlot, dsuReport);
-                    }
-
-                    auto ret = vigem_target_ds4_update_ex(vigem_client, player.ds4Controller, report);
-                    const auto vigemComplete = SteadyClock::now();
-                    if (!VIGEM_SUCCESS(ret)) {
-                         // std::wcerr << L"Failed to update DS4 EX report: 0x" << std::hex << ret << L"\n";
-                    }
-
-                    g_latencyLogger.Record(
-                        g_runtimeOptions.updatePolicy,
-                        ControllerTypeName(SingleJoyCon),
-                        ++player.latency.eventIndex,
-                        bleDeltaMs,
-                        0.0,
-                        -1.0,
-                        MicrosecondsBetween(decodeStart, vigemComplete),
-                        MicrosecondsBetween(notificationReceived, vigemComplete));
-                });
-
-            auto status = player.joycon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (player.joycon.writeChar) {
-                SendCustomCommands(player.joycon.writeChar);
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                SetPlayerLEDs(player.joycon.writeChar, 0x01); // Player 1 (Solid LED 1)
+        if (player.side == JoyConSide::Right) {
+            uint32_t btnState = ExtractButtonState(buf);
+            bool chatPressed = (btnState & 0x000040) != 0;
+            if (chatPressed && !player.wasChatPressed) {
+                player.mouseMode = (player.mouseMode + 1) % 4;
+                const char* names[] = {"OFF","FAST","NORMAL","SLOW"};
+                uint8_t leds[] = {0x01, 0x02, 0x04, 0x08};
+                AppLog(std::string("Mouse mode: ") + names[player.mouseMode]);
+                SetPlayerLEDs(player.joycon.writeChar, leds[player.mouseMode]);
                 EmitSound(player.joycon.writeChar);
             }
+            player.wasChatPressed = chatPressed;
 
-            if (status == GattCommunicationStatus::Success)
-                std::wcout << L"Notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable notifications.\n";
-
-            std::wcout << L"Press Enter to continue...\n";
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
-        }
-        else if (config.controllerType == DualJoyCon) {
-            std::wcout << L"Please sync your RIGHT Joy-Con now.\n";
-            ConnectedJoyCon rightJoyCon = WaitForJoyCon(L"Waiting for RIGHT Joy-Con...");
-            if (rightJoyCon.writeChar) {
-                SendCustomCommands(rightJoyCon.writeChar);
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                SetPlayerLEDs(rightJoyCon.writeChar, 0x01);
-                EmitSound(rightJoyCon.writeChar);
-            }
-
-            // Request minimum BLE connection interval for right Joy-Con
-            try {
-                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
-                rightJoyCon.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for RIGHT Joy-Con (Windows may ignore this request).\n";
-            }
-            catch (...) {
-                std::wcout << L"Warning: Could not request preferred connection parameters for RIGHT Joy-Con.\n";
-            }
-
-            std::wcout << L"Please sync your LEFT Joy-Con now.\n";
-            ConnectedJoyCon leftJoyCon = WaitForJoyCon(L"Waiting for LEFT Joy-Con...");
-            if (leftJoyCon.writeChar) {
-                SendCustomCommands(leftJoyCon.writeChar);
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                SetPlayerLEDs(leftJoyCon.writeChar, 0x08); // Player 2 (Solid LED 4? or specific pattern for left?)
-                EmitSound(leftJoyCon.writeChar);
-            }
-
-            // Request minimum BLE connection interval for left Joy-Con
-            try {
-                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
-                leftJoyCon.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for LEFT Joy-Con (Windows may ignore this request).\n";
-            }
-            catch (...) {
-                std::wcout << L"Warning: Could not request preferred connection parameters for LEFT Joy-Con.\n";
-            }
-
-            PVIGEM_TARGET ds4Controller = vigem_target_ds4_alloc();
-            auto ret = vigem_target_add(vigem_client, ds4Controller);
-            if (!VIGEM_SUCCESS(ret))
-            {
-                std::wcerr << L"Failed to add DS4 controller target: 0x" << std::hex << ret << L"\n";
-                exit(1);
-            }
-
-            auto dualPlayer = std::make_unique<DualJoyConPlayer>();
-            dualPlayer->leftJoyCon = leftJoyCon;
-            dualPlayer->rightJoyCon = rightJoyCon;
-            dualPlayer->gyroSource = config.gyroSource;
-            dualPlayer->gyroMode = config.gyroMode;
-            dualPlayer->motionProfile = config.motionProfile;
-            dualPlayer->dsuSlot = static_cast<uint8_t>(i);
-            dualPlayer->ds4Controller = ds4Controller;
-            dualPlayer->running.store(true);
-            dualPlayer->sharedState = std::make_shared<DualJoyConSharedState>();
-
-            if (dualPlayer->gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
-                dsuServer.SetControllerConnected(dualPlayer->dsuSlot);
-            }
-
-            auto dualSharedState = dualPlayer->sharedState;
-
-            dualPlayer->leftJoyCon.inputChar.ValueChanged([dualSharedState](GattCharacteristic const&, GattValueChangedEventArgs const& args)
-                {
-                    const auto receivedAt = SteadyClock::now();
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(buffer);
-
-                    {
-                        std::lock_guard<std::mutex> lock(dualSharedState->mutex);
-                        dualSharedState->left.bleDeltaMs = MillisecondsBetween(dualSharedState->lastLeftBleTime, receivedAt);
-                        dualSharedState->lastLeftBleTime = receivedAt;
-                        dualSharedState->left.buffer = std::move(buffer);
-                        dualSharedState->left.receivedAt = receivedAt;
-                        dualSharedState->left.sequence = ++dualSharedState->sequence;
+            if (player.mouseMode > 0) {
+                auto [rx, ry] = GetRawOpticalMouse(buf);
+                if (player.firstOpticalRead) { player.lastOpticalX=rx; player.lastOpticalY=ry; player.firstOpticalRead=false; }
+                else {
+                    int16_t dx=rx-player.lastOpticalX, dy=ry-player.lastOpticalY;
+                    player.lastOpticalX=rx; player.lastOpticalY=ry;
+                    if (dx||dy) {
+                        float s = player.mouseMode==1?1.f:player.mouseMode==2?0.6f:0.3f;
+                        INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.dx=(int)(dx*s); ip.mi.dy=(int)(dy*s); ip.mi.dwFlags=MOUSEEVENTF_MOVE;
+                        SendInput(1,&ip,sizeof(ip));
                     }
-                    dualSharedState->cv.notify_one();
-                });
-
-            auto statusLeft = dualPlayer->leftJoyCon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (statusLeft == GattCommunicationStatus::Success)
-                std::wcout << L"LEFT Joy-Con notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable LEFT Joy-Con notifications.\n";
-
-            dualPlayer->rightJoyCon.inputChar.ValueChanged([dualSharedState](GattCharacteristic const&, GattValueChangedEventArgs const& args)
-                {
-                    const auto receivedAt = SteadyClock::now();
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(buffer);
-
-                    {
-                        std::lock_guard<std::mutex> lock(dualSharedState->mutex);
-                        dualSharedState->right.bleDeltaMs = MillisecondsBetween(dualSharedState->lastRightBleTime, receivedAt);
-                        dualSharedState->lastRightBleTime = receivedAt;
-                        dualSharedState->right.buffer = std::move(buffer);
-                        dualSharedState->right.receivedAt = receivedAt;
-                        dualSharedState->right.sequence = ++dualSharedState->sequence;
-                    }
-                    dualSharedState->cv.notify_one();
-                });
-
-            auto statusRight = dualPlayer->rightJoyCon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (statusRight == GattCommunicationStatus::Success)
-                std::wcout << L"RIGHT Joy-Con notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable RIGHT Joy-Con notifications.\n";
-
-            dualPlayer->updateThread = std::thread([dualPlayerPtr = dualPlayer.get(), dualSharedState, &dsuServer]()
-                {
-                    uint64_t lastProcessedSequence = 0;
-                    while (dualPlayerPtr->running.load(std::memory_order_acquire))
-                    {
-                        TimedInputBuffer leftSnapshot;
-                        TimedInputBuffer rightSnapshot;
-
-                        {
-                            std::unique_lock<std::mutex> lock(dualSharedState->mutex);
-                            if (g_runtimeOptions.updatePolicy == UpdatePolicy::Legacy60Hz) {
-                                dualSharedState->cv.wait_for(lock, std::chrono::milliseconds(16), [&]() {
-                                    return !dualPlayerPtr->running.load(std::memory_order_acquire) ||
-                                           dualSharedState->sequence != lastProcessedSequence;
-                                });
-                            }
-                            else {
-                                dualSharedState->cv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
-                                    return !dualPlayerPtr->running.load(std::memory_order_acquire) ||
-                                           dualSharedState->sequence != lastProcessedSequence;
-                                });
-                            }
-
-                            if (!dualPlayerPtr->running.load(std::memory_order_acquire)) {
-                                break;
-                            }
-
-                            if (dualSharedState->left.buffer.empty() || dualSharedState->right.buffer.empty() ||
-                                dualSharedState->sequence == lastProcessedSequence) {
-                                continue;
-                            }
-
-                            const auto now = SteadyClock::now();
-                            if (!ShouldEmitForPolicy(g_runtimeOptions.updatePolicy, dualSharedState->lastEmitTime, now)) {
-                                lastProcessedSequence = dualSharedState->sequence;
-                                continue;
-                            }
-
-                            leftSnapshot = dualSharedState->left;
-                            rightSnapshot = dualSharedState->right;
-                            lastProcessedSequence = dualSharedState->sequence;
-                        }
-
-                        const auto decodeStart = SteadyClock::now();
-                        const MotionProfile ds4Profile = (dualPlayerPtr->gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : dualPlayerPtr->motionProfile;
-                        DS4_REPORT_EX report = GenerateDualJoyConDS4Report(leftSnapshot.buffer, rightSnapshot.buffer, dualPlayerPtr->gyroSource, ds4Profile);
-
-                        if (dualPlayerPtr->gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
-                            DS4_REPORT_EX dsuReport = GenerateDualJoyConDS4Report(leftSnapshot.buffer, rightSnapshot.buffer, dualPlayerPtr->gyroSource, MotionProfile::SwitchEmu);
-                            dsuServer.UpdateController(dualPlayerPtr->dsuSlot, dsuReport);
-                        }
-
-                        auto ret = vigem_target_ds4_update_ex(vigem_client, dualPlayerPtr->ds4Controller, report);
-                        const auto vigemComplete = SteadyClock::now();
-                        if (!VIGEM_SUCCESS(ret))
-                        {
-                            std::wcerr << L"Failed to update DS4 report: 0x" << std::hex << ret << L"\n";
-                        }
-
-                        const auto newestReceivedAt = (leftSnapshot.receivedAt > rightSnapshot.receivedAt) ? leftSnapshot.receivedAt : rightSnapshot.receivedAt;
-                        const double bleDeltaMs = (leftSnapshot.sequence >= rightSnapshot.sequence) ? leftSnapshot.bleDeltaMs : rightSnapshot.bleDeltaMs;
-                        g_latencyLogger.Record(
-                            g_runtimeOptions.updatePolicy,
-                            ControllerTypeName(DualJoyCon),
-                            ++dualSharedState->eventIndex,
-                            bleDeltaMs,
-                            MillisecondsBetween(leftSnapshot.receivedAt, vigemComplete),
-                            MillisecondsBetween(rightSnapshot.receivedAt, vigemComplete),
-                            MicrosecondsBetween(decodeStart, vigemComplete),
-                            MicrosecondsBetween(newestReceivedAt, vigemComplete));
-                    }
-                });
-
-            dualPlayers.push_back(std::move(dualPlayer));
-
-            std::wcout << L"Dual Joy-Cons connected and configured. Press Enter to continue...\n";
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
-        }
-        else if (config.controllerType == ProController) {
-            // Load or create GL/GR layouts configuration
-            if (!LoadProControllerConfig(g_proControllerConfig)) {
-                std::cout << "\nNo existing configuration found. Creating default layout...\n";
-                CreateDefaultConfig();
-                std::cout << "Default layout created: Layout 1 (GL: NONE, GR: NONE)\n";
-                std::cout << "Press ZL+ZR+GL+GR during gameplay to open layout management.\n\n";
-            } else {
-                std::cout << "\nLoaded GL/GR layout configuration:\n";
-                std::cout << "Active Layout: " << g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].name << "\n";
-                std::cout << "  GL -> " << ButtonMappingToString(g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].glMapping) << "\n";
-                std::cout << "  GR -> " << ButtonMappingToString(g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].grMapping) << "\n";
-                std::cout << "Total layouts: " << g_proControllerConfig.layouts.size() << "\n";
-                std::cout << "Press ZL+ZR+GL+GR during gameplay to open layout management.\n";
-                std::cout << "Press C button to cycle through layouts.\n\n";
-            }
-
-            std::wcout << L"Please sync your Pro Controller now.\n";
-
-            ConnectedJoyCon proController = WaitForJoyCon(L"Waiting for Pro Controller...");
-
-            // Request minimum BLE connection interval for lowest latency
-            try {
-                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
-                auto paramResult = proController.device.RequestPreferredConnectionParameters(connectionParams);
-                (void)paramResult;
-
-                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency (Windows may ignore this request).\n";
-            }
-            catch (...) {
-                std::wcout << L"Warning: Could not request preferred connection parameters. Continuing with default settings.\n";
-            }
-
-            PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
-            auto ret = vigem_target_add(vigem_client, ds4_controller);
-            if (!VIGEM_SUCCESS(ret))
-            {
-                std::wcerr << L"Failed to add DS4 controller target: 0x" << std::hex << ret << L"\n";
-                exit(1);
-            }
-
-            auto proLatency = std::make_shared<LatencyTracker>();
-            proController.inputChar.ValueChanged([ds4_controller, motionProfile = config.motionProfile, gyroMode = config.gyroMode, dsuSlot = static_cast<uint8_t>(i), &dsuServer, proLatency](GattCharacteristic const&, GattValueChangedEventArgs const& args) mutable
-                {
-                    const auto notificationReceived = SteadyClock::now();
-                    auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(buffer);
-                    const double bleDeltaMs = MillisecondsBetween(proLatency->lastBleTime, notificationReceived);
-                    proLatency->lastBleTime = notificationReceived;
-
-                    if (!ShouldEmitForPolicy(g_runtimeOptions.updatePolicy, proLatency->lastEmitTime, SteadyClock::now())) {
-                        return;
-                    }
-
-                    const auto decodeStart = SteadyClock::now();
-                    const MotionProfile ds4Profile = (gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
-                    DS4_REPORT_EX report = GenerateProControllerReport(buffer, ds4Profile);
-
-                    // Apply GL/GR button mappings
-                    ApplyGLGRMappings(report, buffer);
-
-                    // Handle special buttons (Screenshot -> F12, C button)
-                    HandleSpecialProButtons(buffer);
-
-                    if (gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
-                        DS4_REPORT_EX dsuReport = GenerateProControllerReport(buffer, MotionProfile::SwitchEmu);
-                        ApplyGLGRMappings(dsuReport, buffer);
-                        dsuServer.UpdateController(dsuSlot, dsuReport);
-                    }
-
-                    auto ret = vigem_target_ds4_update_ex(vigem_client, ds4_controller, report);
-                    const auto vigemComplete = SteadyClock::now();
-                    if (!VIGEM_SUCCESS(ret)) {
-                        std::wcerr << L"Failed to update DS4 EX report: 0x" << std::hex << ret << L"\n";
-                    }
-
-                    g_latencyLogger.Record(
-                        g_runtimeOptions.updatePolicy,
-                        ControllerTypeName(ProController),
-                        ++proLatency->eventIndex,
-                        bleDeltaMs,
-                        0.0,
-                        -1.0,
-                        MicrosecondsBetween(decodeStart, vigemComplete),
-                        MicrosecondsBetween(notificationReceived, vigemComplete));
-                });
-
-            auto status = proController.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-
-            if (proController.writeChar) {
-                SendCustomCommands(proController.writeChar);
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                SetPlayerLEDs(proController.writeChar, 0x01);
-                EmitSound(proController.writeChar);
-            }
-
-            if (status == GattCommunicationStatus::Success)
-                std::wcout << L"Pro Controller notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable Pro Controller notifications.\n";
-
-            if (config.gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
-                dsuServer.SetControllerConnected(static_cast<uint8_t>(i));
-            }
-
-            std::wcout << L"Press Enter to continue...\n";
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
-
-            proPlayers.push_back({ proController, ds4_controller });
-        }
-        else if (config.controllerType == NSOGCController) {
-            std::wcout << L"Please sync your NSO GameCube Controller now.\n";
-
-            ConnectedJoyCon gcController = WaitForJoyCon(L"Waiting for NSO GC Controller...");
-
-            // Request minimum BLE connection interval for lowest latency
-            try {
-                auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
-                gcController.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency (Windows may ignore this request).\n";
-            }
-            catch (...) {
-                std::wcout << L"Warning: Could not request preferred connection parameters.\n";
-            }
-
-            PVIGEM_TARGET ds4_controller = vigem_target_ds4_alloc();
-            auto ret = vigem_target_add(vigem_client, ds4_controller);
-            if (!VIGEM_SUCCESS(ret)) {
-                std::wcerr << L"Failed to add DS4 controller target: 0x" << std::hex << ret << L"\n";
-                exit(1);
-            }
-
-            gcController.inputChar.ValueChanged([ds4_controller](GattCharacteristic const&, GattValueChangedEventArgs const& args) mutable {
-                auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
-                reader.ReadBytes(buffer);
-
-                DS4_REPORT_EX report = GenerateNSOGCReport(buffer);
-
-                auto ret = vigem_target_ds4_update_ex(vigem_client, ds4_controller, report);
-                if (!VIGEM_SUCCESS(ret)) {
-                    std::wcerr << L"Failed to update DS4 EX report: 0x" << std::hex << ret << L"\n";
                 }
-                });
+                bool R=(btnState&0x004000)!=0, ZR=(btnState&0x008000)!=0, ST=(btnState&0x000004)!=0;
+                auto mkMouse=[](DWORD f){INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.dwFlags=f; SendInput(1,&ip,sizeof(ip));};
+                if (R&&!player.leftBtnPressed)   mkMouse(MOUSEEVENTF_LEFTDOWN);
+                if (!R&&player.leftBtnPressed)   mkMouse(MOUSEEVENTF_LEFTUP);
+                player.leftBtnPressed=R;
+                if (ZR&&!player.rightBtnPressed) mkMouse(MOUSEEVENTF_RIGHTDOWN);
+                if (!ZR&&player.rightBtnPressed) mkMouse(MOUSEEVENTF_RIGHTUP);
+                player.rightBtnPressed=ZR;
+                if (ST&&!player.middleBtnPressed) mkMouse(MOUSEEVENTF_MIDDLEDOWN);
+                if (!ST&&player.middleBtnPressed) mkMouse(MOUSEEVENTF_MIDDLEUP);
+                player.middleBtnPressed=ST;
 
-            auto status = gcController.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+                auto sd = DecodeJoystick(buf, player.side, player.orientation);
+                const int SZ=4000, BT=28000;
+                if (abs(sd.y)>SZ) {
+                    float inten=(abs(sd.y)-SZ)/(32767.f-SZ);
+                    float spd=inten*40.f;
+                    player.scrollAccumulator += sd.y>0 ? -spd : spd;
+                    if (abs(player.scrollAccumulator)>=120.f) {
+                        int clicks=(int)(player.scrollAccumulator/120.f);
+                        player.scrollAccumulator-=clicks*120.f;
+                        INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.mouseData=clicks*120; ip.mi.dwFlags=MOUSEEVENTF_WHEEL;
+                        SendInput(1,&ip,sizeof(ip));
+                    }
+                } else player.scrollAccumulator=0.f;
+                auto mkX=[](DWORD xb, DWORD f){INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.mouseData=xb; ip.mi.dwFlags=f; SendInput(1,&ip,sizeof(ip));};
+                if (sd.x<-BT&&!player.mb4Pressed) { mkX(XBUTTON1,MOUSEEVENTF_XDOWN); mkX(XBUTTON1,MOUSEEVENTF_XUP); player.mb4Pressed=true; }
+                else if (sd.x>=-BT) player.mb4Pressed=false;
+                if (sd.x>BT&&!player.mb5Pressed) { mkX(XBUTTON2,MOUSEEVENTF_XDOWN); mkX(XBUTTON2,MOUSEEVENTF_XUP); player.mb5Pressed=true; }
+                else if (sd.x<=BT) player.mb5Pressed=false;
+                buf[4]&=~0x40; buf[4]&=~0x80; buf[5]&=~0x04;
+                if (buf.size()>=16){buf[13]=0x00;buf[14]=0x08;buf[15]=0x80;}
+            } else player.firstOpticalRead=true;
+        }
 
-            if (gcController.writeChar) {
-                SendCustomCommands(gcController.writeChar); // Optional, only if NSO GC expects init commands
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                SetPlayerLEDs(gcController.writeChar, 0x01);
-                EmitSound(gcController.writeChar);
-            }
-
-            if (status == GattCommunicationStatus::Success)
-                std::wcout << L"NSO GC Controller notifications enabled.\n";
-            else
-                std::wcout << L"Failed to enable NSO GC Controller notifications.\n";
-
-            std::wcout << L"Press Enter to continue...\n";
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
-
-            proPlayers.push_back({ gcController, ds4_controller }); // reuse ProControllerPlayer struct
+        if (!ShouldEmit(g_opts.updatePolicy, player.latency.lastEmitTime, SteadyClock::now())) return;
+        const auto ds = SteadyClock::now();
+        MotionProfile mp = (gyroMode==GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
+        DS4_REPORT_EX report = GenerateDS4Report(buf, player.side, player.orientation, mp);
+        if (gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) {
+            DS4_REPORT_EX dr = GenerateDS4Report(buf, player.side, player.orientation, MotionProfile::SwitchEmu);
+            g_dsuServer.UpdateController(dsuSlot, dr);
+        }
+        vigem_target_ds4_update_ex(g_vigem, player.ds4Controller, report);
+        const auto vc = SteadyClock::now();
+        g_latencyLogger.Record(g_opts.updatePolicy, CtrlTypeName(1), ++player.latency.eventIndex,
+                               bleDelta, 0.0, -1.0, UsBetween(ds,vc), UsBetween(now,vc));
+    });
 }
-    }
 
-    std::wcout << L"All players connected.\n";
-    std::wcout << L"- Press Enter to exit\n";
-    std::wcout << L"- Press ZL+ZR+GL+GR on Pro Controller to open layout management\n";
-    std::wcout << L"- Press C button on Pro Controller to cycle layouts\n\n";
+static ID3D11Device*           g_pd3dDevice       = nullptr;
+static ID3D11DeviceContext*    g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain*         g_pSwapChain        = nullptr;
+static ID3D11RenderTargetView* g_mainRTV           = nullptr;
+static HWND                    g_hwnd              = nullptr;
 
-    // Main loop: monitor for management window trigger and exit command
-    while (true) {
-        // Check if management window should be opened
-        if (g_openManagementWindow.load()) {
-            g_openManagementWindow.store(false);
-            std::cout << "\n[ZL+ZR+GL+GR combo detected! Opening layout management...]\n";
-            ShowLayoutManagementWindow();
-            std::cout << "\nResuming gameplay...\n";
-            std::cout << "Active layout: " << g_proControllerConfig.layouts[g_proControllerConfig.activeLayoutIndex].name << "\n";
-            std::cout << "Press Enter to exit, or ZL+ZR+GL+GR to manage layouts again.\n\n";
-        }
+static void CreateRTV() {
+    ID3D11Texture2D* bb = nullptr;
+    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&bb));
+    g_pd3dDevice->CreateRenderTargetView(bb, nullptr, &g_mainRTV);
+    bb->Release();
+}
+static void CleanupRTV() { if (g_mainRTV){g_mainRTV->Release();g_mainRTV=nullptr;} }
+static bool CreateDX11(HWND hwnd) {
+    DXGI_SWAP_CHAIN_DESC sd{};
+    sd.BufferCount=2; sd.BufferDesc.Width=0; sd.BufferDesc.Height=0;
+    sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator=60; sd.BufferDesc.RefreshRate.Denominator=1;
+    sd.Flags=DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hwnd;
+    sd.SampleDesc.Count=1; sd.Windowed=TRUE; sd.SwapEffect=DXGI_SWAP_EFFECT_DISCARD;
+    D3D_FEATURE_LEVEL fl;
+    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,
+        D3D11_SDK_VERSION,&sd,&g_pSwapChain,&g_pd3dDevice,&fl,&g_pd3dDeviceContext))) return false;
+    CreateRTV(); return true;
+}
+static void CleanupDX11() {
+    CleanupRTV();
+    if (g_pSwapChain)        { g_pSwapChain->Release();        g_pSwapChain=nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release();  g_pd3dDeviceContext=nullptr; }
+    if (g_pd3dDevice)        { g_pd3dDevice->Release();         g_pd3dDevice=nullptr; }
+}
 
-        // Check for user input (non-blocking check)
-        // Use a short sleep and check if Enter was pressed
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        // Check if input is available (simple approach for Windows)
-        if (_kbhit()) {
-            std::wstring dummy;
-            std::getline(std::wcin, dummy);
+static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
+    switch(msg) {
+        case WM_SIZE:
+            if (g_pd3dDevice && wParam != SIZE_MINIMIZED) {
+                CleanupRTV();
+                g_pSwapChain->ResizeBuffers(0,(UINT)LOWORD(lParam),(UINT)HIWORD(lParam),DXGI_FORMAT_UNKNOWN,0);
+                CreateRTV();
+            }
+            return 0;
+        case WM_SYSCOMMAND:
+            if ((wParam&0xfff0)==SC_KEYMENU) return 0;
             break;
+        case WM_DESTROY:
+            PostQuitMessage(0); return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void HelpMarker(const char* txt) {
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) { ImGui::BeginTooltip(); ImGui::TextUnformatted(txt); ImGui::EndTooltip(); }
+}
+
+static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
+    ImGui::PushID(i);
+    ImGui::TableNextRow();
+
+    ImGui::TableSetColumnIndex(0);
+    ImGui::Text("Player %d", i+1);
+
+    ImGui::TableSetColumnIndex(1);
+    const char* ctypes[] = {"Single JoyCon","Dual JoyCon","Pro Controller","NSO GC"};
+    int ct = (int)cfg.controllerType - 1;
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##type", &ct, ctypes, 4))
+        cfg.controllerType = (ControllerType)(ct+1);
+
+    ImGui::TableSetColumnIndex(2);
+    if (cfg.controllerType == SingleJoyCon) {
+        const char* sides[] = {"Left","Right"};
+        int s = (cfg.joyconSide == JoyConSide::Left) ? 0 : 1;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##side", &s, sides, 2))
+            cfg.joyconSide = s==0 ? JoyConSide::Left : JoyConSide::Right;
+    } else ImGui::TextDisabled("—");
+
+    ImGui::TableSetColumnIndex(3);
+    if (cfg.controllerType == SingleJoyCon) {
+        const char* orients[] = {"Upright","Sideways"};
+        int o = (cfg.joyconOrientation == JoyConOrientation::Upright) ? 0 : 1;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##orient", &o, orients, 2))
+            cfg.joyconOrientation = o==0 ? JoyConOrientation::Upright : JoyConOrientation::Sideways;
+    } else ImGui::TextDisabled("—");
+
+    ImGui::TableSetColumnIndex(4);
+    if (cfg.controllerType == DualJoyCon) {
+        const char* gs[] = {"Both","Left","Right"};
+        int g = (cfg.gyroSource==GyroSource::Both)?0:(cfg.gyroSource==GyroSource::Left)?1:2;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##gyrosrc", &g, gs, 3))
+            cfg.gyroSource = g==0?GyroSource::Both:g==1?GyroSource::Left:GyroSource::Right;
+    } else ImGui::TextDisabled("—");
+
+    ImGui::TableSetColumnIndex(5);
+    if (cfg.controllerType != NSOGCController) {
+        const char* gm[] = {"DS4 Raw","DS4 Switch Emu","DSU UDP"};
+        int gv = (cfg.gyroMode==GyroMode::DS4Raw)?0:(cfg.gyroMode==GyroMode::DS4SwitchEmu)?1:2;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##gyromode", &gv, gm, 3)) {
+            cfg.gyroMode = gv==0?GyroMode::DS4Raw:gv==1?GyroMode::DS4SwitchEmu:GyroMode::DsuUdp;
+            cfg.motionProfile = gv==0?MotionProfile::Raw:MotionProfile::SwitchEmu;
         }
+    } else ImGui::TextDisabled("—");
+
+    ImGui::PopID();
+}
+
+static void DrawSetupScreen() {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos({0,0}); ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::Begin("##setup", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse);
+
+    ImGui::Spacing();
+    ImGui::SetCursorPosX((io.DisplaySize.x - ImGui::CalcTextSize("joycon2cpp").x) * 0.5f);
+    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "joycon2cpp");
+    ImGui::Separator(); ImGui::Spacing();
+
+    if (ImGui::CollapsingHeader("Players", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Spacing();
+        if (ImGui::BeginTable("players", 6,
+            ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Player",       ImGuiTableColumnFlags_WidthFixed, 60);
+            ImGui::TableSetupColumn("Type",         ImGuiTableColumnFlags_WidthStretch, 1.4f);
+            ImGui::TableSetupColumn("Side",         ImGuiTableColumnFlags_WidthStretch, 0.8f);
+            ImGui::TableSetupColumn("Orientation",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
+            ImGui::TableSetupColumn("Gyro Source",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
+            ImGui::TableSetupColumn("Gyro Output",  ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < (int)g_playerConfigs.size(); ++i)
+                DrawPlayerConfigRow(i, g_playerConfigs[i]);
+
+            ImGui::EndTable();
+        }
+        ImGui::Spacing();
+        if (ImGui::Button("+ Add Player") && g_playerConfigs.size() < 4)
+            g_playerConfigs.push_back({});
+        ImGui::SameLine();
+        if (ImGui::Button("- Remove Last") && g_playerConfigs.size() > 1)
+            g_playerConfigs.pop_back();
+        ImGui::Spacing();
     }
 
-    // Clean up dual player threads & free controllers
-    for (auto& dp : dualPlayers)
-    {
-        dp->running.store(false);
-        if (dp->sharedState) {
-            dp->sharedState->cv.notify_all();
-        }
-        if (dp->updateThread.joinable())
-            dp->updateThread.join();
+    if (ImGui::CollapsingHeader("Settings")) {
+        ImGui::Spacing();
+        ImGui::Indent(10);
 
-        vigem_target_remove(vigem_client, dp->ds4Controller);
+        const char* policies[] = {"Low Latency (immediate)","Balanced 120Hz","Legacy 60Hz"};
+        int pol = (int)g_opts.updatePolicy;
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::Combo("Update Policy", &pol, policies, 3))
+            g_opts.updatePolicy = (UpdatePolicy)pol;
+        ImGui::SameLine(); HelpMarker("Low Latency forwards every BLE packet immediately.\nBalanced/Legacy cap the output rate.");
+
+        ImGui::Checkbox("Record latency metrics to CSV", &g_opts.latencyMetrics);
+        if (g_opts.latencyMetrics) {
+            ImGui::SetNextItemWidth(300);
+            ImGui::InputText("CSV path", g_opts.latencyCsvPath, sizeof(g_opts.latencyCsvPath));
+        }
+
+        ImGui::Unindent(10);
+        ImGui::Spacing();
+    }
+
+    if (ImGui::CollapsingHeader("Stick Calibration")) {
+        ImGui::Spacing();
+        ImGui::Indent(10);
+        ImGui::TextWrapped("Calibrate after connecting. Connect your controllers first, then open this panel in-session.");
+
+        const auto& cal = GetActiveCalibration();
+        ImGui::Spacing();
+        if (ImGui::BeginTable("calvals", 4, ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableSetupColumn("Stick"); ImGui::TableSetupColumn("Center");
+            ImGui::TableSetupColumn("Range X"); ImGui::TableSetupColumn("Range Y");
+            ImGui::TableHeadersRow();
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::Text("Left");
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%d, %d", cal.leftStick.centerX, cal.leftStick.centerY);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%d–%d", cal.leftStick.minX, cal.leftStick.maxX);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%d–%d", cal.leftStick.minY, cal.leftStick.maxY);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::Text("Right");
+            ImGui::TableSetColumnIndex(1); ImGui::Text("%d, %d", cal.rightStick.centerX, cal.rightStick.centerY);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%d–%d", cal.rightStick.minX, cal.rightStick.maxX);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%d–%d", cal.rightStick.minY, cal.rightStick.maxY);
+            ImGui::EndTable();
+        }
+
+        ImGui::Spacing();
+        if (ImGui::Button("Reset to defaults")) {
+            CalibrationProfile def;
+            def.name = "Default";
+            while (GetCalibrationProfiles().size() > 1)
+                DeleteCalibrationProfile(1);
+            DeleteCalibrationProfile(0);
+            AddCalibrationProfile(def);
+            SetActiveCalibrationIndex(0);
+            SaveCalibrationProfiles("calibration.json");
+        }
+        ImGui::Unindent(10);
+        ImGui::Spacing();
+    }
+
+    bool hasProController = false;
+    for (auto& pc : g_playerConfigs) if (pc.controllerType == ProController) { hasProController = true; break; }
+    if (hasProController && ImGui::CollapsingHeader("Pro Controller GL/GR Layouts")) {
+        ImGui::Spacing();
+        ImGui::Indent(10);
+        ImGui::Text("Active layout: %s", g_proConfig.layouts[g_proConfig.activeLayoutIndex].name);
+        ImGui::Spacing();
+        for (int i = 0; i < (int)g_proConfig.layouts.size(); ++i) {
+            ImGui::PushID(i);
+            auto& lay = g_proConfig.layouts[i];
+            bool isActive = (i == g_proConfig.activeLayoutIndex);
+            if (isActive) ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
+            bool open = ImGui::TreeNodeEx(lay.name, ImGuiTreeNodeFlags_Framed);
+            if (isActive) ImGui::PopStyleColor();
+            if (open) {
+                ImGui::InputText("Name##n", lay.name, 64);
+                int gl = (int)lay.glMapping, gr = (int)lay.grMapping;
+                ImGui::SetNextItemWidth(160); ImGui::Combo("GL##gl", &gl, BtnMapNames, 17); lay.glMapping=(ButtonMapping)gl;
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(160); ImGui::Combo("GR##gr", &gr, BtnMapNames, 17); lay.grMapping=(ButtonMapping)gr;
+                ImGui::Spacing();
+                if (!isActive && ImGui::Button("Set Active")) { g_proConfig.activeLayoutIndex=i; SaveProConfig(); }
+                ImGui::SameLine();
+                if (g_proConfig.layouts.size()>1 && ImGui::Button("Delete")) {
+                    g_proConfig.layouts.erase(g_proConfig.layouts.begin()+i);
+                    if (g_proConfig.activeLayoutIndex>=(int)g_proConfig.layouts.size())
+                        g_proConfig.activeLayoutIndex=(int)g_proConfig.layouts.size()-1;
+                    SaveProConfig(); ImGui::TreePop(); ImGui::PopID(); break;
+                }
+                SaveProConfig();
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        if (ImGui::Button("+ New Layout")) {
+            GLGRLayout nl; snprintf(nl.name,64,"Layout %d",(int)g_proConfig.layouts.size()+1);
+            g_proConfig.layouts.push_back(nl); SaveProConfig();
+        }
+        ImGui::Unindent(10);
+        ImGui::Spacing();
+    }
+
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+    float btnW = 180;
+    ImGui::SetCursorPosX((io.DisplaySize.x - btnW) * 0.5f);
+    ImGui::PushStyleColor(ImGuiCol_Button,        {0.2f,0.6f,0.2f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.3f,0.75f,0.3f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.15f,0.5f,0.15f,1.f});
+    bool doConnect = ImGui::Button("Connect Controllers", {btnW, 36});
+    ImGui::PopStyleColor(3);
+
+    if (doConnect && !g_playerConfigs.empty()) {
+        g_connectionTasks.clear();
+        for (int i = 0; i < (int)g_playerConfigs.size(); ++i) {
+            auto& pc = g_playerConfigs[i];
+            if (pc.controllerType == SingleJoyCon) {
+                std::string side = (pc.joyconSide==JoyConSide::Left)?"Left":"Right";
+                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — " + side + " JoyCon"});
+            } else if (pc.controllerType == DualJoyCon) {
+                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — RIGHT JoyCon"});
+                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — LEFT JoyCon"});
+            } else if (pc.controllerType == ProController) {
+                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — Pro Controller"});
+            } else {
+                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — NSO GC Controller"});
+            }
+        }
+        g_connectionTaskIndex = 0;
+        g_connectionDone      = false;
+        g_connectionError     = "";
+        g_screen = AppScreen::Connecting;
+
+        InitViGEm();
+        bool needsDsu = false;
+        for (auto& pc : g_playerConfigs) if (pc.gyroMode==GyroMode::DsuUdp) { needsDsu=true; break; }
+        if (needsDsu) g_dsuServer.Start();
+        if (g_opts.latencyMetrics)
+            g_latencyLogger.Start(g_opts.latencyCsvPath);
+
+        std::thread([configs = g_playerConfigs]() mutable {
+            int taskIdx = 0;
+
+            g_singlePlayers.clear();
+            g_dualPlayers.clear();
+            g_proPlayers.clear();
+
+            int dsuSlot = 0;
+            for (int pi = 0; pi < (int)configs.size(); ++pi) {
+                auto& pc = configs[pi];
+
+                if (pc.controllerType == SingleJoyCon) {
+                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    bool ok = false;
+                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
+                    if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
+                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
+                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
+                    auto t = AddDS4();
+                    g_singlePlayers.push_back({ cj, t, pc.joyconSide, pc.joyconOrientation });
+                    auto& player = g_singlePlayers.back();
+                    if (pc.gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
+                    AttachSingleJoyConHandler(player, pc.gyroMode, pc.motionProfile, dsuSlot);
+                    cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+                    AppLog("Player " + std::to_string(pi+1) + " Single JoyCon connected");
+                    ++taskIdx; ++dsuSlot;
+
+                } else if (pc.controllerType == DualJoyCon) {
+                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    bool okR = false;
+                    auto rjc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okR);
+                    if (!okR) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
+                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
+                    if (rjc.writeChar) { SendCustomCommands(rjc.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(rjc.writeChar,0x01); EmitSound(rjc.writeChar); }
+                    ++taskIdx;
+
+                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    bool okL = false;
+                    auto ljc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okL);
+                    if (!okL) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
+                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
+                    if (ljc.writeChar) { SendCustomCommands(ljc.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(ljc.writeChar,0x08); EmitSound(ljc.writeChar); }
+                    ++taskIdx;
+
+                    auto dp = std::make_unique<DualJoyConPlayer>();
+                    dp->leftJoyCon=ljc; dp->rightJoyCon=rjc;
+                    dp->gyroSource=pc.gyroSource; dp->gyroMode=pc.gyroMode;
+                    dp->motionProfile=pc.motionProfile; dp->dsuSlot=dsuSlot;
+                    dp->ds4Controller=AddDS4(); dp->running.store(true);
+                    dp->sharedState=std::make_shared<DualJoyConSharedState>();
+                    if (dp->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
+                    auto ss=dp->sharedState;
+                    ljc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
+                        auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
+                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
+                        FeedCalibBuffer(buf, true);
+                        std::lock_guard<std::mutex> lk(ss->mutex);
+                        ss->left.bleDeltaMs=MsBetween(ss->lastLeftBleTime,now); ss->lastLeftBleTime=now;
+                        ss->left.buffer=std::move(buf); ss->left.receivedAt=now; ss->left.sequence=++ss->sequence;
+                        ss->cv.notify_one();
+                    });
+                    ljc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+                    rjc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
+                        auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
+                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
+                        FeedCalibBuffer(buf, false);
+                        std::lock_guard<std::mutex> lk(ss->mutex);
+                        ss->right.bleDeltaMs=MsBetween(ss->lastRightBleTime,now); ss->lastRightBleTime=now;
+                        ss->right.buffer=std::move(buf); ss->right.receivedAt=now; ss->right.sequence=++ss->sequence;
+                        ss->cv.notify_one();
+                    });
+                    rjc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+                    dp->updateThread=std::thread([dpptr=dp.get(),ss](){
+                        uint64_t lastSeq=0;
+                        while (dpptr->running.load(std::memory_order_acquire)) {
+                            TimedInputBuffer ls,rs;
+                            {
+                                std::unique_lock<std::mutex> lk(ss->mutex);
+                                ss->cv.wait_for(lk,std::chrono::milliseconds(1),[&]{ return !dpptr->running.load()||ss->sequence!=lastSeq; });
+                                if (!dpptr->running.load()) break;
+                                if (ss->left.buffer.empty()||ss->right.buffer.empty()||ss->sequence==lastSeq) continue;
+                                auto now=SteadyClock::now();
+                                if (!ShouldEmit(g_opts.updatePolicy,ss->lastEmitTime,now)){lastSeq=ss->sequence;continue;}
+                                ls=ss->left; rs=ss->right; lastSeq=ss->sequence;
+                            }
+                            MotionProfile mp=(dpptr->gyroMode==GyroMode::DsuUdp)?MotionProfile::Raw:dpptr->motionProfile;
+                            auto report=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,mp);
+                            if (dpptr->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
+                                auto dr=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,MotionProfile::SwitchEmu);
+                                g_dsuServer.UpdateController(dpptr->dsuSlot,dr);
+                            }
+                            vigem_target_ds4_update_ex(g_vigem,dpptr->ds4Controller,report);
+                        }
+                    });
+                    g_dualPlayers.push_back(std::move(dp));
+                    AppLog("Player " + std::to_string(pi+1) + " Dual JoyCon connected");
+                    ++dsuSlot;
+
+                } else if (pc.controllerType == ProController) {
+                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    bool ok = false;
+                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
+                    if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
+                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
+                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
+                    auto tgt=AddDS4();
+                    auto latPtr=std::make_shared<LatencyTracker>();
+                    auto gm=pc.gyroMode; auto mp=pc.motionProfile; uint8_t ds=(uint8_t)dsuSlot;
+                    cj.inputChar.ValueChanged([tgt,gm,mp,ds,latPtr](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
+                        auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
+                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
+                        FeedCalibBuffer(buf, g_calib.isLeft);
+                        double bd=MsBetween(latPtr->lastBleTime,now); latPtr->lastBleTime=now;
+                        if (!ShouldEmit(g_opts.updatePolicy,latPtr->lastEmitTime,SteadyClock::now())) return;
+                        auto ds4p=(gm==GyroMode::DsuUdp)?MotionProfile::Raw:mp;
+                        DS4_REPORT_EX report=GenerateProControllerReport(buf,ds4p);
+                        ApplyGLGR(report,buf); HandleSpecialProButtons(buf);
+                        if (gm==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
+                            DS4_REPORT_EX dr=GenerateProControllerReport(buf,MotionProfile::SwitchEmu);
+                            ApplyGLGR(dr,buf); g_dsuServer.UpdateController(ds,dr);
+                        }
+                        vigem_target_ds4_update_ex(g_vigem,tgt,report);
+                    });
+                    cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+                    if (pc.gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
+                    g_proPlayers.push_back({cj,tgt});
+                    AppLog("Player " + std::to_string(pi+1) + " Pro Controller connected");
+                    ++taskIdx; ++dsuSlot;
+
+                } else {
+                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
+                    bool ok = false;
+                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
+                    if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
+                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
+                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
+                    auto tgt=AddDS4();
+                    cj.inputChar.ValueChanged([tgt](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
+                        auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
+                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
+                        DS4_REPORT_EX report=GenerateNSOGCReport(buf);
+                        vigem_target_ds4_update_ex(g_vigem,tgt,report);
+                    });
+                    cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+                    g_proPlayers.push_back({cj,tgt});
+                    AppLog("Player " + std::to_string(pi+1) + " NSO GC connected");
+                    ++taskIdx; ++dsuSlot;
+                }
+            }
+            g_connectionDone = true;
+        }).detach();
+    }
+
+    ImGui::End();
+}
+
+static void DrawConnectingScreen() {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos({0,0}); ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::Begin("##connecting", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove);
+
+    ImGui::Spacing();
+    ImGui::SetCursorPosX((io.DisplaySize.x - ImGui::CalcTextSize("Connecting...").x)*0.5f);
+    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "Connecting...");
+    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+    if (!g_connectionError.empty()) {
+        ImGui::TextColored({1.f,0.3f,0.3f,1.f}, "Error: %s", g_connectionError.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button("Back to Setup")) { g_connectionError=""; g_screen=AppScreen::Setup; }
+    } else {
+        for (auto& t : g_connectionTasks) {
+            if (t.done) {
+                ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "[OK] %s", t.label.c_str());
+            } else {
+                static float spin = 0.f; spin += ImGui::GetIO().DeltaTime * 3.f;
+                const char* spinners[] = {"|","/","-","\\"};
+                ImGui::TextColored({1.f,0.8f,0.2f,1.f}, "[%s] %s — %s",
+                    spinners[(int)(spin)%4], t.label.c_str(), t.statusMsg.c_str());
+                break;
+            }
+        }
+
+        ImGui::Spacing();
+        if (g_connectionDone) {
+            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "All controllers connected!");
+            ImGui::Spacing();
+            float bw=120;
+            ImGui::SetCursorPosX((io.DisplaySize.x-bw)*0.5f);
+            ImGui::PushStyleColor(ImGuiCol_Button,{0.2f,0.6f,0.2f,1.f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,{0.3f,0.75f,0.3f,1.f});
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,{0.15f,0.5f,0.15f,1.f});
+            if (ImGui::Button("Start!", {bw,36})) g_screen=AppScreen::Running;
+            ImGui::PopStyleColor(3);
+        }
+    }
+    ImGui::End();
+}
+
+static void DrawCalibWizard() {
+    if (!g_calib.active) return;
+    UpdateCalibLiveValues();
+
+    ImGui::OpenPopup("Stick Calibration Wizard");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, {0.5f,0.5f});
+    ImGui::SetNextWindowSize({480,360}, ImGuiCond_Always);
+
+    if (ImGui::BeginPopupModal("Stick Calibration Wizard", &g_calib.active)) {
+        const char* stickName = g_calib.isLeft ? "Left Stick" : "Right Stick";
+        ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "Calibrating: %s", stickName);
+        ImGui::Separator(); ImGui::Spacing();
+
+        ImGui::Text("Raw X: %4d   Raw Y: %4d", g_calib.rawX, g_calib.rawY);
+        ImGui::Spacing();
+
+        if (g_calib.step == 0) {
+            ImGui::TextWrapped("This wizard will calibrate your stick's center and range.\n\n"
+                               "Step 1: Release the stick and let it sit at rest. Then click Capture Center.");
+            ImGui::Spacing();
+            if (ImGui::Button("Capture Center", {160,32})) {
+                g_calib.centerX = g_calib.rawX;
+                g_calib.centerY = g_calib.rawY;
+                g_calib.step = 1;
+            }
+        } else if (g_calib.step == 1) {
+            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "Center captured: %d, %d", g_calib.centerX, g_calib.centerY);
+            ImGui::Spacing();
+            ImGui::TextWrapped("Step 2: Slowly rotate the stick all the way around in a full circle to capture the extents.\n"
+                               "Click Start Capture, rotate, then click Done.");
+            ImGui::Spacing();
+            if (!g_calib.capturing) {
+                if (ImGui::Button("Start Capturing Extents", {200,32})) {
+                    g_calib.minX=4095; g_calib.maxX=0; g_calib.minY=4095; g_calib.maxY=0;
+                    g_calib.captureFrames=0; g_calib.capturing=true;
+                }
+            } else {
+                ImGui::TextColored({1.f,0.5f,0.1f,1.f}, "Capturing... rotate the stick fully!");
+                ImGui::Text("Frames: %d   MinX:%d MaxX:%d MinY:%d MaxY:%d",
+                    g_calib.captureFrames, g_calib.minX, g_calib.maxX, g_calib.minY, g_calib.maxY);
+                if (ImGui::Button("Done Rotating", {160,32})) {
+                    g_calib.capturing = false;
+                    g_calib.step = 2;
+                }
+            }
+        } else if (g_calib.step == 2) {
+            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "Center: %d, %d", g_calib.centerX, g_calib.centerY);
+            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "X Range: %d – %d", g_calib.minX, g_calib.maxX);
+            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "Y Range: %d – %d", g_calib.minY, g_calib.maxY);
+            ImGui::Spacing();
+            ImGui::TextWrapped("Review the values above. Click Apply to save, or Redo to recapture.");
+            ImGui::Spacing();
+            if (ImGui::Button("Apply", {100,32})) {
+                if (g_calib.minX >= g_calib.maxX || g_calib.minY >= g_calib.maxY
+                    || g_calib.captureFrames < 10) {
+                    AppLog("Calibration failed: rotate the stick fully before applying.");
+                    g_calib.step = 1;
+                } else {
+                    CalibrationProfile updated = GetActiveCalibration();
+                    auto& sc = g_calib.isLeft ? updated.leftStick : updated.rightStick;
+                    sc.centerX = g_calib.centerX; sc.centerY = g_calib.centerY;
+                    sc.minX = g_calib.minX;       sc.maxX = g_calib.maxX;
+                    sc.minY = g_calib.minY;       sc.maxY = g_calib.maxY;
+                    int idx = GetActiveCalibrationIndex();
+                    DeleteCalibrationProfile(idx);
+                    AddCalibrationProfile(updated);
+                    SetActiveCalibrationIndex((int)GetCalibrationProfiles().size()-1);
+                    SaveCalibrationProfiles("calibration.json");
+                    AppLog(std::string("Calibration applied for ") + stickName);
+                    g_calib.active = false;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Redo", {100,32})) { g_calib.step=0; }
+        }
+
+        ImGui::Spacing(); ImGui::Separator();
+        if (ImGui::Button("Cancel")) g_calib.active=false;
+        ImGui::EndPopup();
+    }
+}
+
+static void DrawLayoutManager() {
+    if (!g_showLayoutManager) return;
+    ImGui::OpenPopup("GL/GR Layout Manager");
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, {0.5f,0.5f});
+    ImGui::SetNextWindowSize({500,400}, ImGuiCond_Always);
+
+    if (ImGui::BeginPopupModal("GL/GR Layout Manager", &g_showLayoutManager)) {
+        ImGui::Text("Active: %s", g_proConfig.layouts[g_proConfig.activeLayoutIndex].name);
+        ImGui::Separator(); ImGui::Spacing();
+
+        for (int i = 0; i < (int)g_proConfig.layouts.size(); ++i) {
+            ImGui::PushID(i);
+            auto& lay = g_proConfig.layouts[i];
+            bool isActive = (i == g_proConfig.activeLayoutIndex);
+            if (isActive) ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f,0.3f,0.15f,1.f));
+            ImGui::BeginChild(ImGui::GetID("##lay"), {-1,80}, true);
+            ImGui::InputText("##name", lay.name, 64);
+            ImGui::SameLine();
+            if (isActive) ImGui::TextColored({0.3f,1.f,0.3f,1.f},"[ACTIVE]");
+            int gl=(int)lay.glMapping, gr=(int)lay.grMapping;
+            ImGui::SetNextItemWidth(140); ImGui::Combo("GL##g", &gl, BtnMapNames, 17); lay.glMapping=(ButtonMapping)gl;
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140); ImGui::Combo("GR##r", &gr, BtnMapNames, 17); lay.grMapping=(ButtonMapping)gr;
+            ImGui::SameLine();
+            if (!isActive && ImGui::SmallButton("Set Active")) { g_proConfig.activeLayoutIndex=i; SaveProConfig(); }
+            ImGui::SameLine();
+            if (g_proConfig.layouts.size()>1 && ImGui::SmallButton("Del")) {
+                g_proConfig.layouts.erase(g_proConfig.layouts.begin()+i);
+                if (g_proConfig.activeLayoutIndex>=(int)g_proConfig.layouts.size())
+                    g_proConfig.activeLayoutIndex=(int)g_proConfig.layouts.size()-1;
+                SaveProConfig(); ImGui::EndChild(); if (isActive) ImGui::PopStyleColor(); ImGui::PopID(); break;
+            }
+            ImGui::EndChild();
+            if (isActive) ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+
+        ImGui::Spacing();
+        if (ImGui::Button("+ New Layout")) {
+            GLGRLayout nl; snprintf(nl.name,64,"Layout %d",(int)g_proConfig.layouts.size()+1);
+            g_proConfig.layouts.push_back(nl); SaveProConfig();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Close")) { g_showLayoutManager=false; SaveProConfig(); }
+        ImGui::EndPopup();
+    }
+}
+
+static void DrawRunningScreen() {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos({0,0}); ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::Begin("##running", nullptr,
+        ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove);
+
+    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "joycon2cpp — Running");
+    ImGui::SameLine(io.DisplaySize.x - 110);
+    ImGui::PushStyleColor(ImGuiCol_Button,{0.6f,0.2f,0.2f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,{0.75f,0.3f,0.3f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,{0.5f,0.15f,0.15f,1.f});
+    if (ImGui::Button("Disconnect & Exit", {80,0})) PostQuitMessage(0);
+    ImGui::PopStyleColor(3);
+    ImGui::Separator(); ImGui::Spacing();
+
+    if (ImGui::CollapsingHeader("Connected Controllers", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Indent(10);
+        for (int i=0; i<(int)g_singlePlayers.size(); ++i) {
+            auto& p=g_singlePlayers[i];
+            ImGui::BulletText("Single JoyCon (%s, %s)",
+                p.side==JoyConSide::Left?"Left":"Right",
+                p.orientation==JoyConOrientation::Upright?"Upright":"Sideways");
+        }
+        for (int i=0; i<(int)g_dualPlayers.size(); ++i)
+            ImGui::BulletText("Dual JoyCon pair");
+        for (int i=0; i<(int)g_proPlayers.size(); ++i)
+            ImGui::BulletText("Pro / NSO GC Controller");
+        ImGui::Unindent(10); ImGui::Spacing();
+    }
+
+    if (ImGui::CollapsingHeader("Stick Calibration")) {
+        ImGui::Indent(10);
+        ImGui::TextDisabled("Connect a JoyCon first, then calibrate below.");
+        ImGui::Spacing();
+
+        bool hasAny = !g_singlePlayers.empty() || !g_dualPlayers.empty() || !g_proPlayers.empty();
+        if (!hasAny) {
+            ImGui::TextColored({1.f,0.6f,0.2f,1.f},"No controllers connected.");
+        } else {
+            ImGui::Text("Stick to calibrate:");
+            ImGui::SameLine();
+            if (ImGui::Button("Left Stick##cal")) ResetCalib(true);
+            ImGui::SameLine();
+            if (ImGui::Button("Right Stick##cal")) ResetCalib(false);
+        }
+
+        const auto& cal=GetActiveCalibration();
+        ImGui::Spacing();
+        ImGui::Text("Left:  center(%d,%d)  X[%d-%d]  Y[%d-%d]",
+            cal.leftStick.centerX,cal.leftStick.centerY,
+            cal.leftStick.minX,cal.leftStick.maxX,cal.leftStick.minY,cal.leftStick.maxY);
+        ImGui::Text("Right: center(%d,%d)  X[%d-%d]  Y[%d-%d]",
+            cal.rightStick.centerX,cal.rightStick.centerY,
+            cal.rightStick.minX,cal.rightStick.maxX,cal.rightStick.minY,cal.rightStick.maxY);
+        ImGui::Unindent(10); ImGui::Spacing();
+    }
+
+    bool hasProActive = !g_proPlayers.empty();
+    if (hasProActive && ImGui::CollapsingHeader("GL/GR Layouts")) {
+        ImGui::Indent(10);
+        ImGui::Text("Active: %s  (GL: %s, GR: %s)",
+            g_proConfig.layouts[g_proConfig.activeLayoutIndex].name,
+            BtnMapStr(g_proConfig.layouts[g_proConfig.activeLayoutIndex].glMapping),
+            BtnMapStr(g_proConfig.layouts[g_proConfig.activeLayoutIndex].grMapping));
+        ImGui::SameLine();
+        if (ImGui::Button("Manage Layouts")) g_showLayoutManager = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Next Layout")) {
+            g_proConfig.activeLayoutIndex = (g_proConfig.activeLayoutIndex+1) % (int)g_proConfig.layouts.size();
+            SaveProConfig();
+        }
+        ImGui::Unindent(10); ImGui::Spacing();
+    }
+
+    if (ImGui::CollapsingHeader("Settings")) {
+        ImGui::Indent(10);
+        const char* policies[]={"Low Latency","Balanced 120Hz","Legacy 60Hz"};
+        int pol=(int)g_opts.updatePolicy;
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::Combo("Update Policy##run",&pol,policies,3))
+            g_opts.updatePolicy=(UpdatePolicy)pol;
+        ImGui::Unindent(10); ImGui::Spacing();
+    }
+
+    if (ImGui::CollapsingHeader("Log", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BeginChild("##log",{-1,150},true);
+        std::lock_guard<std::mutex> lk(g_logMutex);
+        for (auto& line : g_logLines) ImGui::TextUnformatted(line.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.f);
+        ImGui::EndChild();
+    }
+
+    if (g_openLayoutManager.load()) { g_openLayoutManager.store(false); g_showLayoutManager=true; }
+
+    DrawCalibWizard();
+    DrawLayoutManager();
+
+    ImGui::End();
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    init_apartment();
+    LoadProConfig();
+    LoadCalibrationProfiles("calibration.json");
+
+    if (g_playerConfigs.empty()) g_playerConfigs.push_back({});
+
+    WNDCLASSEXW wc{sizeof(WNDCLASSEXW), CS_CLASSDC, WndProc, 0L, 0L, hInst,
+                   nullptr, nullptr, nullptr, nullptr, L"joycon2cpp", nullptr};
+    RegisterClassExW(&wc);
+    g_hwnd = CreateWindowW(L"joycon2cpp", L"joycon2cpp",
+                           WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                           900, 620, nullptr, nullptr, hInst, nullptr);
+
+    if (!CreateDX11(g_hwnd)) { DestroyWindow(g_hwnd); UnregisterClassW(wc.lpszClassName, hInst); return 1; }
+    ShowWindow(g_hwnd, SW_SHOWDEFAULT);
+    UpdateWindow(g_hwnd);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    ImGui::StyleColorsDark();
+    auto& style = ImGui::GetStyle();
+    style.WindowRounding = 6.f;
+    style.FrameRounding  = 4.f;
+    style.GrabRounding   = 4.f;
+    style.WindowBorderSize = 0.f;
+    style.Colors[ImGuiCol_WindowBg] = {0.08f,0.08f,0.10f,1.f};
+    style.Colors[ImGuiCol_Header]   = {0.18f,0.35f,0.55f,1.f};
+
+    ImGui_ImplWin32_Init(g_hwnd);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+
+    bool done = false;
+    while (!done) {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            TranslateMessage(&msg); DispatchMessage(&msg);
+            if (msg.message == WM_QUIT) done = true;
+        }
+        if (done) break;
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        switch (g_screen) {
+            case AppScreen::Setup:      DrawSetupScreen();      break;
+            case AppScreen::Connecting: DrawConnectingScreen(); break;
+            case AppScreen::Running:    DrawRunningScreen();    break;
+        }
+
+        ImGui::Render();
+        const float cc[4] = {0.06f,0.06f,0.08f,1.f};
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRTV, cc);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        g_pSwapChain->Present(1, 0);
+    }
+
+    for (auto& dp : g_dualPlayers) {
+        dp->running.store(false);
+        if (dp->sharedState) dp->sharedState->cv.notify_all();
+        if (dp->updateThread.joinable()) dp->updateThread.join();
+        vigem_target_remove(g_vigem, dp->ds4Controller);
         vigem_target_free(dp->ds4Controller);
     }
+    for (auto& sp : g_singlePlayers) { vigem_target_remove(g_vigem,sp.ds4Controller); vigem_target_free(sp.ds4Controller); }
+    for (auto& pp : g_proPlayers)    { vigem_target_remove(g_vigem,pp.ds4Controller); vigem_target_free(pp.ds4Controller); }
+    if (g_vigem) { vigem_disconnect(g_vigem); vigem_free(g_vigem); g_vigem=nullptr; }
+    g_dsuServer.Stop();
 
-    // Free single players controllers
-    for (auto& sp : singlePlayers)
-    {
-        vigem_target_remove(vigem_client, sp.ds4Controller);
-        vigem_target_free(sp.ds4Controller);
-    }
-
-    // Free Pro Controllers
-    for (auto& pp : proPlayers)
-    {
-        vigem_target_remove(vigem_client, pp.ds4Controller);
-        vigem_target_free(pp.ds4Controller);
-    }
-
-    if (vigem_client)
-    {
-        vigem_disconnect(vigem_client);
-        vigem_free(vigem_client);
-        vigem_client = nullptr;
-    }
-
-    dsuServer.Stop();
-
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
+    CleanupDX11();
+    DestroyWindow(g_hwnd);
+    UnregisterClassW(wc.lpszClassName, hInst);
     return 0;
 }
