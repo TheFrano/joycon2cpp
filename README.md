@@ -18,8 +18,8 @@ You're free to make your own macOS/Linux fork if you want.
 ---
 
 ## How do I use it?
-- Download the exe in the source code and open it, or optionally build the source code and open the created exe file
-- Pick your amount of players
+- Download the latest release's .exe file (or, optionally, build from source as detailed below) and open it
+- Use the UI to add players, pick their controllers and set everything up (settings are explained in detail below)
 - Pick everyone's controller
 - If using a singular joycon you'll be asked if its Left or Right
 - If using dual joycons itll ask you to pair one joycon then the other
@@ -29,6 +29,35 @@ You're free to make your own macOS/Linux fork if you want.
 >  Note: Bit layouts differ slightly between left and right Joy-Cons, so correct side pairing is important.
 > 
 ---
+
+## In-App Settings
+This section details what each setting does.
+- SIDE
+
+Only relevant for Single Joycons. Only here because the layouts for L/R differ and the program needs to know that to parse input correctly.
+
+Left/Right - Left/Right Joycon
+- Orientation
+
+The orientation of Single Joycons.
+
+Upright/Sideways - Upright/Sideways orientation
+
+- Gyro Source
+  
+Controls what controller's gyro/accel data to use. Dual Joycon only.
+
+Both - Uses both joycons.
+
+Left/Right - Uses either the left or right joycon's data only.
+
+- Gyro Output
+  
+This setting controls where gyro/accel data will be fed to. 
+
+DS4 Raw: Feeds the data directly into the controller. Sometimes, this won't work (e.g if the controller shows up as WGInput, only works if its SDL)
+
+DSU UDP: Feeds the data via DSU for Dolphin/Cemu's DSU Client. Uses the stock Dolphin IP and Port (127.0.0.1, 26760)
 
 ## Building from source
 
@@ -66,9 +95,6 @@ Make sure the following are installed via Visual Studio Installer:
 
 # Joy-Con 2 BLE Notification Research
 (this section is for documenting the Joy-Con 2's behavior and function. if you're just looking to use the program, this section isnt important.)
-
-
-
 
 
 This document outlines some findings related to Joy-Con 2 BLE input behavior. If you're developing or reverse-engineering Joy-Con 2, Pro Controller 2, or other supported Nintendo controllers over BLE, this may be useful.
