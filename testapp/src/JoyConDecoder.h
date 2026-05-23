@@ -2,6 +2,7 @@
 #include <vector>
 #include <utility>
 #include <cstdint>
+#include <string>
 #include <Windows.h>
 #include <ViGEm/Client.h>
 
@@ -23,11 +24,35 @@ struct MotionData {
     SHORT accelX, accelY, accelZ;
 };
 
+struct StickCalibration {
+    int centerX = 2048;
+    int centerY = 2048;
+    int minX = 0;
+    int maxX = 4095;
+    int minY = 0;
+    int maxY = 4095;
+};
+
+struct CalibrationProfile {
+    std::string name;
+    StickCalibration leftStick;
+    StickCalibration rightStick;
+};
+
+void LoadCalibrationProfiles(const std::string& path);
+void SaveCalibrationProfiles(const std::string& path);
+void ExtractRawStick(const std::vector<uint8_t>& buffer, bool isLeft, int& outX, int& outY);
+const std::vector<CalibrationProfile>& GetCalibrationProfiles();
+void AddCalibrationProfile(const CalibrationProfile& profile);
+void DeleteCalibrationProfile(int index);
+int GetActiveCalibrationIndex();
+void SetActiveCalibrationIndex(int index);
+const CalibrationProfile& GetActiveCalibration();
+
 DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation, MotionProfile profile = MotionProfile::Raw);
 DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer, const std::vector<uint8_t>& rightBuffer, GyroSource gyroSource, MotionProfile profile = MotionProfile::Raw);
 DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer, MotionProfile profile = MotionProfile::Raw);
 DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer);
-
 uint32_t ExtractButtonState(const std::vector<uint8_t>& buffer);
 std::pair<int16_t, int16_t> GetRawOpticalMouse(const std::vector<uint8_t>& buffer);
 StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation);
