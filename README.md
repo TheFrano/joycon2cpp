@@ -33,7 +33,9 @@ You're free to make your own macOS/Linux fork if you want.
 ## Rumble Instructions
 Note: Rumble does not work in Steam. (i am unsure as to why)
 - When picking the motor in your emulator, pick the corresponding side depending on controller. (eg. Motor L for left joycon)
-- If playing with Dual Joycons or a ProCon2/NSOGC Controller, all rumble data gets replicated to all motors, so picking any of them works fine.
+- If playing with Dual Joycons or a ProCon2 controller, all rumble data gets replicated to all motors, so picking any of them works fine.
+- Rumble is not supported for the NSOGC Controller
+- (pro controller rumble is untested! let me know if it doesnt work!!!)
 
 ## In-App Settings
 This section details what each setting does.
