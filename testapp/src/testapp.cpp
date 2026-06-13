@@ -559,24 +559,31 @@ static void SendVibrationSample(GattCharacteristic const& ch, uint8_t sampleId)
     SendGenericCommand(ch, 0x0A, 0x02, data);
 }
 
-
 static void StartSingleRumbleThread(SingleRumbleCtx* ctx) {
-    ctx->thread = std::thread([ctx]() {;
+    ctx->thread = std::thread([ctx]() {
         DS4_OUTPUT_DATA last{};
+        int silentFrames = 0;
         while (ctx->running.load() && !g_shuttingDown.load()) {
             DS4_OUTPUT_DATA out{};
             auto err = vigem_target_ds4_get_output(g_vigem, ctx->target, &out);
             if (VIGEM_SUCCESS(err)) {
-                if (out.LargeMotor != last.LargeMotor || out.SmallMotor != last.SmallMotor) {
-                    last = out;
-                    float amp = std::max(out.LargeMotor, out.SmallMotor) / 255.0f;
+                float amp = std::max(out.LargeMotor, out.SmallMotor) / 255.0f;
+                if (amp >= 0.01f) {
                     SendRumble(ctx->vibrationChar, amp);
-                    if (ctx->secondaryVibrationChar) {
+                    if (ctx->secondaryVibrationChar)
                         SendRumble(ctx->secondaryVibrationChar, amp);
+                    silentFrames = 0;
+                } else {
+                    if (silentFrames == 0) {
+                        SendRumble(ctx->vibrationChar, 0.0f);
+                        if (ctx->secondaryVibrationChar)
+                            SendRumble(ctx->secondaryVibrationChar, 0.0f);
                     }
+                    silentFrames++;
                 }
+                last = out;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
         }
     });
 }
@@ -584,25 +591,25 @@ static void StartSingleRumbleThread(SingleRumbleCtx* ctx) {
 static void StartDualRumbleThread(DualRumbleCtx* ctx) {
     ctx->thread = std::thread([ctx]() {
         DS4_OUTPUT_DATA last{};
-
+        int silentFrames = 0;
         while (ctx->running.load() && !g_shuttingDown.load()) {
             DS4_OUTPUT_DATA out{};
             auto err = vigem_target_ds4_get_output(g_vigem, ctx->target, &out);
-
             if (VIGEM_SUCCESS(err)) {
-                float merged = std::max(out.LargeMotor, out.SmallMotor) / 255.0f;
-
-                if (merged > 0.01f) {
-                    SendRumble(ctx->leftVibration, merged);
-                    SendRumble(ctx->rightVibration, merged);
-                } else if (last.LargeMotor != 0 || last.SmallMotor != 0) {
-                    SendRumble(ctx->leftVibration, 0.0f);
-                    SendRumble(ctx->rightVibration, 0.0f);
+                float amp = std::max(out.LargeMotor, out.SmallMotor) / 255.0f;
+                if (amp >= 0.01f) {
+                    SendRumble(ctx->leftVibration, amp);
+                    SendRumble(ctx->rightVibration, amp);
+                    silentFrames = 0;
+                } else {
+                    if (silentFrames == 0) {
+                        SendRumble(ctx->leftVibration, 0.0f);
+                        SendRumble(ctx->rightVibration, 0.0f);
+                    }
+                    silentFrames++;
                 }
-
                 last = out;
             }
-
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
         }
     });
