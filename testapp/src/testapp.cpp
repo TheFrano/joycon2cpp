@@ -50,6 +50,18 @@ constexpr uint16_t JOYCON_MANUFACTURER_ID = 1363;
 const std::vector<uint8_t> JOYCON_MANUFACTURER_PREFIX = { 0x01, 0x00, 0x03, 0x7E };
 const wchar_t* INPUT_REPORT_UUID  = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
 const wchar_t* WRITE_COMMAND_UUID = L"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
+
+
+const wchar_t* CMD_RESPONSE_UUID_BASIC = L"c765a961-d9d8-4d36-a20a-5315b111836a";
+const wchar_t* CMD_RESPONSE_UUID_L     = L"63a3810f-aec7-474b-9010-3d52403cb996";
+const wchar_t* CMD_RESPONSE_UUID_R     = L"640ca58e-0e88-410c-a7f3-426faf2b690b";
+
+const wchar_t* RUMBLE_CHAR_UUID_L = L"ce49a830-dced-48ae-931e-c8cf88aadbea";
+const wchar_t* RUMBLE_CHAR_UUID_R = L"65a724b3-f1e7-4a61-8078-a342376b27ff";
+
+const wchar_t* VIBRATION_CHAR_UUID_L = L"289326cb-a471-485d-a8f4-240c14f18241";
+const wchar_t* VIBRATION_CHAR_UUID_R = L"fa19b0fb-cd1f-46a7-84a1-bbb09e00c149";
+
 const std::string CONFIG_FILE = "joycon2cpp_config.json";
 
 enum class UpdatePolicy { LowLatency, Balanced120Hz, Legacy60Hz };
@@ -94,6 +106,12 @@ struct ConnectedJoyCon {
     BluetoothLEDevice      device    = nullptr;
     GattCharacteristic     inputChar = nullptr;
     GattCharacteristic     writeChar = nullptr;
+    GattCharacteristic     rumbleChar = nullptr;
+    GattCharacteristic     vibrationChar = nullptr;
+    GattCharacteristic     vibrationCharLeft = nullptr;
+    GattCharacteristic     vibrationCharRight = nullptr;
+    GattCharacteristic     cmdRespBasicChar = nullptr;
+    GattCharacteristic     cmdRespExtChar = nullptr;
 };
 
 using SteadyClock = std::chrono::steady_clock;
@@ -162,6 +180,22 @@ struct ConnectionTask {
     std::thread        worker;
 };
 
+
+struct SingleRumbleCtx {
+    GattCharacteristic  vibrationChar;
+    PVIGEM_TARGET       target    = nullptr;
+    GattCharacteristic  secondaryVibrationChar = nullptr;
+    std::atomic<bool>   running{true};
+    std::thread         thread;
+};
+struct DualRumbleCtx {
+    GattCharacteristic  leftVibration;
+    GattCharacteristic  rightVibration;
+    PVIGEM_TARGET       target    = nullptr;
+    std::atomic<bool>   running{true};
+    std::thread         thread;
+};
+
 static AppScreen              g_screen        = AppScreen::Setup;
 static RuntimeOptions         g_opts;
 static ProControllerConfig    g_proConfig;
@@ -173,6 +207,10 @@ static std::vector<SingleJoyConPlayer>              g_singlePlayers;
 static std::vector<std::unique_ptr<DualJoyConPlayer>> g_dualPlayers;
 static std::vector<ProControllerPlayer>             g_proPlayers;
 
+static std::vector<SingleRumbleCtx*> g_singleRumbleCtxs;
+static std::vector<DualRumbleCtx*>   g_dualRumbleCtxs;
+static std::vector<SingleRumbleCtx*> g_proRumbleCtxs;
+
 static std::vector<ConnectionTask>  g_connectionTasks;
 static int                          g_connectionTaskIndex = 0;
 static bool                         g_connectionDone      = false;
@@ -183,6 +221,7 @@ static bool g_screenshotButtonPressed = false;
 static bool g_cButtonPressed          = false;
 static bool g_comboPressed            = false;
 static std::atomic<bool> g_openLayoutManager{false};
+static std::atomic<bool> g_shuttingDown{false};
 
 static std::mutex         g_logMutex;
 static std::vector<std::string> g_logLines;
@@ -334,37 +373,243 @@ static void LoadProConfig() {
         g_proConfig.activeLayoutIndex = 0;
 }
 
+
+static std::string HexBytes(const std::vector<uint8_t>& bytes) {
+    std::string hex;
+    hex.reserve(bytes.size() * 3);
+    for (auto b : bytes) {
+        char buf[4];
+        sprintf_s(buf, "%02X ", b);
+        hex += buf;
+    }
+    return hex;
+}
+
+static void AttachCommandResponseLogger(
+    GattCharacteristic const& ch,
+    const std::string& name,
+    GattClientCharacteristicConfigurationDescriptorValue cccValue =
+        GattClientCharacteristicConfigurationDescriptorValue::Notify)
+{
+    if (!ch) {
+        return;
+    }
+
+    ch.ValueChanged([name](GattCharacteristic const&, GattValueChangedEventArgs const& args) {
+        if (g_shuttingDown.load()) return;
+        auto rdr = DataReader::FromBuffer(args.CharacteristicValue());
+        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
+        rdr.ReadBytes(buf);
+
+
+        if (buf.size() >= 8) {
+            char tmp[160];
+            sprintf_s(tmp,"[CMDRESP] parsed cmd=0x%02X sub=0x%02X ack0=0x%02X ack1=0x%02X transport=0x%02X",buf[0], buf[3], buf[4], buf[5], buf[2]);
+        }
+    });
+
+    try {
+        auto status = ch.WriteClientCharacteristicConfigurationDescriptorAsync(cccValue).get();
+    } catch (...) { }
+}
+
 static void SendGenericCommand(GattCharacteristic const& ch, uint8_t cmdId, uint8_t subId, const std::vector<uint8_t>& data) {
-    if (!ch) return;
+    if (g_shuttingDown.load()) return;
+    if (!ch) {
+        return;
+    }
+
+    std::vector<uint8_t> pkt;
+    pkt.reserve(8 + data.size());
+    pkt.push_back(cmdId);
+    pkt.push_back(0x91);
+    pkt.push_back(0x01); 
+    pkt.push_back(subId);
+    pkt.push_back(0x00);
+    pkt.push_back((uint8_t)data.size());
+    pkt.push_back(0x00);
+    pkt.push_back(0x00);
+    pkt.insert(pkt.end(), data.begin(), data.end());
+
     DataWriter w;
-    w.WriteByte(cmdId); w.WriteByte(0x91); w.WriteByte(0x01);
-    w.WriteByte(subId); w.WriteByte(0x00); w.WriteByte((uint8_t)data.size());
-    w.WriteByte(0x00); w.WriteByte(0x00);
-    for (auto b : data) w.WriteByte(b);
-    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse).get();
+    w.WriteBytes(pkt);
+    try {
+        auto status = ch.WriteValueAsync(
+            w.DetachBuffer(),
+            GattWriteOption::WriteWithoutResponse
+        ).get();
+    } catch (...) {
+        return;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 static void SetPlayerLEDs(GattCharacteristic const& ch, uint8_t pat) {
     std::vector<uint8_t> d(8, 0); d[0] = pat;
     SendGenericCommand(ch, 0x09, 0x07, d);
 }
+
+static void SendVibrationSample(GattCharacteristic const& ch, uint8_t sampleId);
+
 static void EmitSound(GattCharacteristic const& ch) {
-    std::vector<uint8_t> d(8, 0); d[0] = 0x04;
-    SendGenericCommand(ch, 0x0A, 0x02, d);
+    SendVibrationSample(ch, 0x04);
 }
 static void SendCustomCommands(GattCharacteristic const& ch) {
+    if (!ch || g_shuttingDown.load()) return;
     std::vector<std::vector<uint8_t>> cmds = {
-        {0x0c,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0xFF,0x00,0x00,0x00},
-        {0x0c,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0xFF,0x00,0x00,0x00}
+        {0x0c,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},
+
+        {0x0c,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},
     };
+
     for (auto& cmd : cmds) {
-        DataWriter w; w.WriteBytes(cmd);
-        ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse).get();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        DataWriter w;
+        w.WriteBytes(cmd);
+
+        try {
+            auto status = ch.WriteValueAsync(
+                w.DetachBuffer(),
+                GattWriteOption::WriteWithoutResponse
+            ).get();
+        } catch (...) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
-static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> statusCb, bool& outSuccess) {
+static void Send0016Command(GattCharacteristic const& ch, const std::vector<uint8_t>& cmd)
+{
+    if (!ch || g_shuttingDown.load()) return;
+
+    std::vector<uint8_t> pkt(17, 0x00);
+    pkt.insert(pkt.end(), cmd.begin(), cmd.end());
+
+    DataWriter w;
+    w.WriteBytes(pkt);
+    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse);
+}
+
+
+static void SendJoyCon2OfficialInit(GattCharacteristic const& ch)
+{
+    if (!ch || g_shuttingDown.load()) return;
+
+    std::vector<std::vector<uint8_t>> cmds = {
+        {0x07,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x00,0x30,0x01,0x00},
+        {0x10,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
+        {0x16,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
+
+        {0x0A,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00,0x00},
+        {0x09,0x91,0x01,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0C,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},
+
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x80,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x40,0x7E,0x00,0x00,0x40,0xC0,0x1F,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x10,0x7E,0x00,0x00,0x40,0x30,0x01,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x18,0x7E,0x00,0x00,0x00,0x31,0x01,0x00},
+        {0x11,0x91,0x01,0x03,0x00,0x00,0x00,0x00},
+        {0x02,0x91,0x01,0x04,0x00,0x08,0x00,0x00,0x20,0x7E,0x00,0x00,0x60,0x30,0x01,0x00},
+
+
+        {0x0A,0x91,0x01,0x08,0x00,0x14,0x00,0x00,
+         0x01,0x59,0x09,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0x35,0x00,0x46,
+         0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+
+        {0x11,0x91,0x01,0x01,0x00,0x00,0x00,0x00},
+        {0x0C,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0x37,0x00,0x00,0x00},
+    };
+
+    for (auto& cmd : cmds) {
+        Send0016Command(ch, cmd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+}
+
+static void SendRumble(GattCharacteristic const& ch, float amp)
+{
+    if (!ch || g_shuttingDown.load()) return;
+
+    static uint8_t c = 0;
+
+    std::vector<uint8_t> pkt(42, 0x00);
+    pkt[0] = 0x00;
+
+    if (amp >= 0.01f) {
+        pkt[1] = 0x50 | (c & 0x0F);
+
+        const uint8_t strong[5] = {0x93, 0x35, 0x36, 0x1C, 0x0D};
+        const uint8_t weak[5]   = {0x4B, 0x7D, 0x80, 0x5A, 0x02};
+
+        const uint8_t* p = amp > 0.5f ? strong : weak;
+        memcpy(pkt.data() + 2, p, 5);
+
+        c = (c + 1) & 0x0F;
+    }
+
+    DataWriter w;
+    w.WriteBytes(pkt);
+    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse);
+}
+
+static void SendVibrationSample(GattCharacteristic const& ch, uint8_t sampleId)
+{
+    std::vector<uint8_t> data(4, 0);
+    data[0] = sampleId;
+    SendGenericCommand(ch, 0x0A, 0x02, data);
+}
+
+
+static void StartSingleRumbleThread(SingleRumbleCtx* ctx) {
+    ctx->thread = std::thread([ctx]() {;
+        DS4_OUTPUT_DATA last{};
+        while (ctx->running.load() && !g_shuttingDown.load()) {
+            DS4_OUTPUT_DATA out{};
+            auto err = vigem_target_ds4_get_output(g_vigem, ctx->target, &out);
+            if (VIGEM_SUCCESS(err)) {
+                if (out.LargeMotor != last.LargeMotor || out.SmallMotor != last.SmallMotor) {
+                    last = out;
+                    float amp = std::max(out.LargeMotor, out.SmallMotor) / 255.0f;
+                    SendRumble(ctx->vibrationChar, amp);
+                    if (ctx->secondaryVibrationChar) {
+                        SendRumble(ctx->secondaryVibrationChar, amp);
+                    }
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+    });
+}
+
+static void StartDualRumbleThread(DualRumbleCtx* ctx) {
+    ctx->thread = std::thread([ctx]() {
+        DS4_OUTPUT_DATA last{};
+
+        while (ctx->running.load() && !g_shuttingDown.load()) {
+            DS4_OUTPUT_DATA out{};
+            auto err = vigem_target_ds4_get_output(g_vigem, ctx->target, &out);
+
+            if (VIGEM_SUCCESS(err)) {
+                float merged = std::max(out.LargeMotor, out.SmallMotor) / 255.0f;
+
+                if (merged > 0.01f) {
+                    SendRumble(ctx->leftVibration, merged);
+                    SendRumble(ctx->rightVibration, merged);
+                } else if (last.LargeMotor != 0 || last.SmallMotor != 0) {
+                    SendRumble(ctx->leftVibration, 0.0f);
+                    SendRumble(ctx->rightVibration, 0.0f);
+                }
+
+                last = out;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        }
+    });
+}
+
+
+static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> statusCb, bool& outSuccess, JoyConSide side = JoyConSide::Left) {
     outSuccess = false;
     ConnectedJoyCon cj{};
     BluetoothLEDevice device = nullptr;
@@ -373,6 +618,7 @@ static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> status
     std::mutex mtx; std::condition_variable cv;
 
     watcher.Received([&](auto const&, auto const& args) {
+        if (g_shuttingDown.load()) return;
         std::unique_lock<std::mutex> lk(mtx);
         if (found) return;
         auto mfg = args.Advertisement().ManufacturerData();
@@ -395,11 +641,12 @@ static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> status
     statusCb("Scanning... (hold sync button)");
     {
         std::unique_lock<std::mutex> lk(mtx);
-        if (!cv.wait_for(lk, std::chrono::seconds(30), [&]{ return found; })) {
+        if (!cv.wait_for(lk, std::chrono::seconds(30), [&]{ return found || g_shuttingDown.load(); })) {
             watcher.Stop();
-            statusCb("Timed out — device not found");
+            statusCb(g_shuttingDown.load() ? "Cancelled" : "Timed out — device not found");
             return cj;
         }
+        if (g_shuttingDown.load()) { watcher.Stop(); statusCb("Cancelled"); return cj; }
     }
     statusCb("Device found, fetching GATT services...");
     cj.device = device;
@@ -418,14 +665,30 @@ static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> status
         auto cr = svc.GetCharacteristicsAsync().get();
         if (cr.Status() != GattCommunicationStatus::Success) continue;
         for (auto ch : cr.Characteristics()) {
-            if (ch.Uuid() == guid(INPUT_REPORT_UUID))  cj.inputChar = ch;
-            if (ch.Uuid() == guid(WRITE_COMMAND_UUID)) cj.writeChar = ch;
+            if (ch.Uuid() == guid(INPUT_REPORT_UUID))  cj.inputChar  = ch;
+            if (ch.Uuid() == guid(WRITE_COMMAND_UUID)) cj.writeChar  = ch;
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_BASIC)) cj.cmdRespBasicChar = ch;
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_L)) { if (side == JoyConSide::Left)  cj.cmdRespExtChar = ch; }
+            if (ch.Uuid() == guid(CMD_RESPONSE_UUID_R)) { if (side == JoyConSide::Right) cj.cmdRespExtChar = ch; }
+            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_L)) { if (side == JoyConSide::Left)  cj.rumbleChar = ch; }
+            if (ch.Uuid() == guid(RUMBLE_CHAR_UUID_R)) { if (side == JoyConSide::Right) cj.rumbleChar = ch; }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_L)) {
+                cj.vibrationCharLeft = ch;
+                if (side == JoyConSide::Left) cj.vibrationChar = ch;
+            }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_R)) {
+                cj.vibrationCharRight = ch;
+                if (side == JoyConSide::Right) cj.vibrationChar = ch;
+            }
         }
     }
     if (!cj.inputChar || !cj.writeChar) {
         statusCb("Required GATT characteristics not found. Re-pair.");
         return cj;
     }
+
+    AttachCommandResponseLogger(cj.cmdRespBasicChar, "basic 0x001A");
+    AttachCommandResponseLogger(cj.cmdRespExtChar, "extended 0x001E");
     try {
         cj.device.RequestPreferredConnectionParameters(BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
     } catch(...) {}
@@ -443,9 +706,9 @@ static void InitViGEm() {
 }
 static PVIGEM_TARGET AddDS4() {
     auto t = vigem_target_ds4_alloc();
-    vigem_target_set_vid(t, 0x054C);
-    vigem_target_set_pid(t, 0x09CC);
-    vigem_target_add(g_vigem, t);
+    auto err = vigem_target_add(g_vigem, t);
+    if (!VIGEM_SUCCESS(err))
+        AppLog("[ERROR] vigem_target_add failed");
     return t;
 }
 
@@ -575,6 +838,7 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
         [&player, gyroMode, motionProfile, dsuSlot]
         (GattCharacteristic const&, GattValueChangedEventArgs const& args)
     {
+        if (g_shuttingDown.load()) return;
         const auto now = SteadyClock::now();
         auto rdr = DataReader::FromBuffer(args.CharacteristicValue());
         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
@@ -653,6 +917,7 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
             DS4_REPORT_EX dr = GenerateDS4Report(buf, player.side, player.orientation, MotionProfile::SwitchEmu);
             g_dsuServer.UpdateController(dsuSlot, dr);
         }
+        if (g_shuttingDown.load() || !g_vigem || !player.ds4Controller) return;
         vigem_target_ds4_update_ex(g_vigem, player.ds4Controller, report);
         const auto vc = SteadyClock::now();
         g_latencyLogger.Record(g_opts.updatePolicy, CtrlTypeName(1), ++player.latency.eventIndex,
@@ -693,9 +958,17 @@ static void CleanupDX11() {
     if (g_pd3dDevice)        { g_pd3dDevice->Release();         g_pd3dDevice=nullptr; }
 }
 
+static void RequestImmediateExit() {
+    g_shuttingDown.store(true);
+    ExitProcess(0);
+}
+
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
     switch(msg) {
+        case WM_CLOSE:
+            RequestImmediateExit();
+            return 0;
         case WM_SIZE:
             if (g_pd3dDevice && wParam != SIZE_MINIMIZED) {
                 CleanupRTV();
@@ -707,7 +980,10 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if ((wParam&0xfff0)==SC_KEYMENU) return 0;
             break;
         case WM_DESTROY:
-            PostQuitMessage(0); return 0;
+            g_shuttingDown.store(true);
+            g_hwnd = nullptr;
+            PostQuitMessage(0);
+            return 0;
     }
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
@@ -956,6 +1232,13 @@ static void DrawSetupScreen() {
             g_dualPlayers.clear();
             g_proPlayers.clear();
 
+            for (auto* p : g_singleRumbleCtxs) delete p;
+            for (auto* p : g_dualRumbleCtxs)   delete p;
+            for (auto* p : g_proRumbleCtxs)     delete p;
+            g_singleRumbleCtxs.clear();
+            g_dualRumbleCtxs.clear();
+            g_proRumbleCtxs.clear();
+
             int dsuSlot = 0;
             for (int pi = 0; pi < (int)configs.size(); ++pi) {
                 auto& pc = configs[pi];
@@ -963,34 +1246,39 @@ static void DrawSetupScreen() {
                 if (pc.controllerType == SingleJoyCon) {
                     g_connectionTasks[taskIdx].statusMsg = "Scanning...";
                     bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
+                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok, pc.joyconSide);
                     if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
+                    if (cj.rumbleChar) { SendJoyCon2OfficialInit(cj.rumbleChar); }
                     auto t = AddDS4();
                     g_singlePlayers.push_back({ cj, t, pc.joyconSide, pc.joyconOrientation });
                     auto& player = g_singlePlayers.back();
                     if (pc.gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
                     AttachSingleJoyConHandler(player, pc.gyroMode, pc.motionProfile, dsuSlot);
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+
+                    auto* rctx = new SingleRumbleCtx{ cj.vibrationChar, t };
+                    g_singleRumbleCtxs.push_back(rctx);
+                    StartSingleRumbleThread(rctx);
+
                     AppLog("Player " + std::to_string(pi+1) + " Single JoyCon connected");
                     ++taskIdx; ++dsuSlot;
 
                 } else if (pc.controllerType == DualJoyCon) {
                     g_connectionTasks[taskIdx].statusMsg = "Scanning...";
                     bool okR = false;
-                    auto rjc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okR);
+                    auto rjc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okR, JoyConSide::Right);
                     if (!okR) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (rjc.writeChar) { SendCustomCommands(rjc.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(rjc.writeChar,0x01); EmitSound(rjc.writeChar); }
+                    if (rjc.rumbleChar) { SendJoyCon2OfficialInit(rjc.rumbleChar); }
                     ++taskIdx;
 
                     g_connectionTasks[taskIdx].statusMsg = "Scanning...";
                     bool okL = false;
-                    auto ljc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okL);
+                    auto ljc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okL, JoyConSide::Left);
                     if (!okL) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (ljc.writeChar) { SendCustomCommands(ljc.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(ljc.writeChar,0x08); EmitSound(ljc.writeChar); }
+                    if (ljc.rumbleChar) { SendJoyCon2OfficialInit(ljc.rumbleChar); }
                     ++taskIdx;
 
                     auto dp = std::make_unique<DualJoyConPlayer>();
@@ -1002,6 +1290,7 @@ static void DrawSetupScreen() {
                     if (dp->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
                     auto ss=dp->sharedState;
                     ljc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
+                        if (g_shuttingDown.load()) return;
                         auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
                         FeedCalibBuffer(buf, true);
@@ -1012,6 +1301,7 @@ static void DrawSetupScreen() {
                     });
                     ljc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
                     rjc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
+                        if (g_shuttingDown.load()) return;
                         auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
                         FeedCalibBuffer(buf, false);
@@ -1023,7 +1313,7 @@ static void DrawSetupScreen() {
                     rjc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
                     dp->updateThread=std::thread([dpptr=dp.get(),ss](){
                         uint64_t lastSeq=0;
-                        while (dpptr->running.load(std::memory_order_acquire)) {
+                        while (dpptr->running.load(std::memory_order_acquire) && !g_shuttingDown.load()) {
                             TimedInputBuffer ls,rs;
                             {
                                 std::unique_lock<std::mutex> lk(ss->mutex);
@@ -1040,9 +1330,15 @@ static void DrawSetupScreen() {
                                 auto dr=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,MotionProfile::SwitchEmu);
                                 g_dsuServer.UpdateController(dpptr->dsuSlot,dr);
                             }
+                            if (g_shuttingDown.load() || !g_vigem || !dpptr->ds4Controller) break;
                             vigem_target_ds4_update_ex(g_vigem,dpptr->ds4Controller,report);
                         }
                     });
+
+                    auto* rctx = new DualRumbleCtx{ ljc.vibrationChar, rjc.vibrationChar, dp->ds4Controller };
+                    g_dualRumbleCtxs.push_back(rctx);
+                    StartDualRumbleThread(rctx);
+
                     g_dualPlayers.push_back(std::move(dp));
                     AppLog("Player " + std::to_string(pi+1) + " Dual JoyCon connected");
                     ++dsuSlot;
@@ -1053,11 +1349,12 @@ static void DrawSetupScreen() {
                     auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
                     if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
+                    if (cj.rumbleChar) { SendJoyCon2OfficialInit(cj.rumbleChar); }
                     auto tgt=AddDS4();
                     auto latPtr=std::make_shared<LatencyTracker>();
                     auto gm=pc.gyroMode; auto mp=pc.motionProfile; uint8_t ds=(uint8_t)dsuSlot;
                     cj.inputChar.ValueChanged([tgt,gm,mp,ds,latPtr](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
+                        if (g_shuttingDown.load()) return;
                         auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
                         FeedCalibBuffer(buf, g_calib.isLeft);
@@ -1070,10 +1367,23 @@ static void DrawSetupScreen() {
                             DS4_REPORT_EX dr=GenerateProControllerReport(buf,MotionProfile::SwitchEmu);
                             ApplyGLGR(dr,buf); g_dsuServer.UpdateController(ds,dr);
                         }
+                        if (g_shuttingDown.load() || !g_vigem || !tgt) return;
+                        if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         vigem_target_ds4_update_ex(g_vigem,tgt,report);
                     });
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
                     if (pc.gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
+
+                    GattCharacteristic proPrimaryVibration = cj.vibrationChar ? cj.vibrationChar : cj.vibrationCharRight;
+                    GattCharacteristic proSecondaryVibration = cj.vibrationCharRight;
+                    if (!cj.vibrationChar && cj.vibrationCharRight) {
+                        proSecondaryVibration = nullptr;
+                    }
+                    
+                    auto* rctx = new SingleRumbleCtx{ proPrimaryVibration, tgt, proSecondaryVibration };
+                    g_proRumbleCtxs.push_back(rctx);
+                    StartSingleRumbleThread(rctx);
+
                     g_proPlayers.push_back({cj,tgt});
                     AppLog("Player " + std::to_string(pi+1) + " Pro Controller connected");
                     ++taskIdx; ++dsuSlot;
@@ -1084,12 +1394,15 @@ static void DrawSetupScreen() {
                     auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
                     if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
+                    if (cj.rumbleChar) { SendJoyCon2OfficialInit(cj.rumbleChar); }
                     auto tgt=AddDS4();
                     cj.inputChar.ValueChanged([tgt](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
+                        if (g_shuttingDown.load()) return;
                         auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
                         DS4_REPORT_EX report=GenerateNSOGCReport(buf);
+                        if (g_shuttingDown.load() || !g_vigem || !tgt) return;
+                        if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         vigem_target_ds4_update_ex(g_vigem,tgt,report);
                     });
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
@@ -1292,7 +1605,9 @@ static void DrawRunningScreen() {
     ImGui::PushStyleColor(ImGuiCol_Button,{0.6f,0.2f,0.2f,1.f});
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,{0.75f,0.3f,0.3f,1.f});
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,{0.5f,0.15f,0.15f,1.f});
-    if (ImGui::Button("Disconnect & Exit", {80,0})) PostQuitMessage(0);
+    if (ImGui::Button("Disconnect & Exit", {80,0})) {
+        RequestImmediateExit();
+    }
     ImGui::PopStyleColor(3);
     ImGui::Separator(); ImGui::Spacing();
 
@@ -1365,13 +1680,38 @@ static void DrawRunningScreen() {
         ImGui::Unindent(10); ImGui::Spacing();
     }
 
-    if (ImGui::CollapsingHeader("Log", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::BeginChild("##log",{-1,150},true);
-        std::lock_guard<std::mutex> lk(g_logMutex);
-        for (auto& line : g_logLines) ImGui::TextUnformatted(line.c_str());
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-            ImGui::SetScrollHereY(1.f);
-        ImGui::EndChild();
+    if (ImGui::CollapsingHeader("Log", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        static std::string logBuffer;
+        static size_t lastLogCount = 0;
+    
+        if (lastLogCount != g_logLines.size())
+        {
+            std::lock_guard<std::mutex> lk(g_logMutex);
+    
+            logBuffer.clear();
+    
+            for (auto& line : g_logLines)
+            {
+                logBuffer += line;
+                logBuffer += "\r\n";
+            }
+    
+            lastLogCount = g_logLines.size();
+        }
+    
+        if (ImGui::Button("Copy Log"))
+        {
+            ImGui::SetClipboardText(logBuffer.c_str());
+        }
+    
+        ImGui::InputTextMultiline(
+            "##log",
+            logBuffer.data(),
+            logBuffer.capacity() + 1,
+            ImVec2(-FLT_MIN, 150),
+            ImGuiInputTextFlags_ReadOnly
+        );
     }
 
     if (g_openLayoutManager.load()) { g_openLayoutManager.store(false); g_showLayoutManager=true; }
@@ -1444,23 +1784,71 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         g_pSwapChain->Present(1, 0);
     }
 
+    g_shuttingDown.store(true);
+
+    for (auto* p : g_singleRumbleCtxs) if (p) p->running.store(false);
+    for (auto* p : g_dualRumbleCtxs)   if (p) p->running.store(false);
+    for (auto* p : g_proRumbleCtxs)    if (p) p->running.store(false);
+
+    for (auto* p : g_singleRumbleCtxs) { if (p && p->thread.joinable()) p->thread.join(); }
+    for (auto* p : g_dualRumbleCtxs)   { if (p && p->thread.joinable()) p->thread.join(); }
+    for (auto* p : g_proRumbleCtxs)    { if (p && p->thread.joinable()) p->thread.join(); }
+
+    for (auto* p : g_singleRumbleCtxs) delete p;
+    for (auto* p : g_dualRumbleCtxs)   delete p;
+    for (auto* p : g_proRumbleCtxs)    delete p;
+    g_singleRumbleCtxs.clear();
+    g_dualRumbleCtxs.clear();
+    g_proRumbleCtxs.clear();
+
     for (auto& dp : g_dualPlayers) {
+        if (!dp) continue;
         dp->running.store(false);
         if (dp->sharedState) dp->sharedState->cv.notify_all();
-        if (dp->updateThread.joinable()) dp->updateThread.join();
-        vigem_target_remove(g_vigem, dp->ds4Controller);
-        vigem_target_free(dp->ds4Controller);
     }
-    for (auto& sp : g_singlePlayers) { vigem_target_remove(g_vigem,sp.ds4Controller); vigem_target_free(sp.ds4Controller); }
-    for (auto& pp : g_proPlayers)    { vigem_target_remove(g_vigem,pp.ds4Controller); vigem_target_free(pp.ds4Controller); }
-    if (g_vigem) { vigem_disconnect(g_vigem); vigem_free(g_vigem); g_vigem=nullptr; }
+    for (auto& dp : g_dualPlayers) {
+        if (dp && dp->updateThread.joinable()) dp->updateThread.join();
+    }
+
+    if (g_vigem) {
+        for (auto& dp : g_dualPlayers) {
+            if (dp && dp->ds4Controller) {
+                vigem_target_remove(g_vigem, dp->ds4Controller);
+                vigem_target_free(dp->ds4Controller);
+                dp->ds4Controller = nullptr;
+            }
+        }
+        for (auto& sp : g_singlePlayers) {
+            if (sp.ds4Controller) {
+                vigem_target_remove(g_vigem, sp.ds4Controller);
+                vigem_target_free(sp.ds4Controller);
+                sp.ds4Controller = nullptr;
+            }
+        }
+        for (auto& pp : g_proPlayers) {
+            if (pp.ds4Controller) {
+                vigem_target_remove(g_vigem, pp.ds4Controller);
+                vigem_target_free(pp.ds4Controller);
+                pp.ds4Controller = nullptr;
+            }
+        }
+
+        vigem_disconnect(g_vigem);
+        vigem_free(g_vigem);
+        g_vigem = nullptr;
+    }
+
     g_dsuServer.Stop();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
     CleanupDX11();
-    DestroyWindow(g_hwnd);
+    if (g_hwnd) {
+        DestroyWindow(g_hwnd);
+        g_hwnd = nullptr;
+    }
     UnregisterClassW(wc.lpszClassName, hInst);
+    uninit_apartment();
     return 0;
 }
