@@ -19,22 +19,25 @@ You're free to make your own macOS/Linux fork if you want.
 
 ---
 
-## How do I use it?
+## Usage Guide
 - Download the latest release's .exe file (or, optionally, build from source as detailed below) and open it
 - Use the UI to add players, pick their controllers and set everything up (settings are explained in detail below)
-- Pick everyone's controller
-- If using a singular joycon you'll be asked if its Left or Right
-- If using dual joycons itll ask you to pair one joycon then the other
-- When its all done, you'll have SDL controllers ready for every player to use.
+- Follow the onscreen pairing instructions and pair the correct controllers for each player
+- When completed, you will have WGInput controllers ready for every player to use. (they show up as Sony DualShock4 Gamepad)
 - Click the chat button to toggle mouse functions，3 adjustable modes for the mouse pointer.
 
 >  Note: Bit layouts differ slightly between left and right Joy-Cons, so correct side pairing is important.
 > 
 ---
 
+## Rumble Instructions
+Note: Rumble does not work in Steam. (i am unsure as to why)
+- When picking the motor in your emulator, pick the corresponding side depending on controller. (eg. Motor L for left joycon)
+- If playing with Dual Joycons or a ProCon2/NSOGC Controller, all rumble data gets replicated to all motors, so picking any of them works fine.
+
 ## In-App Settings
 This section details what each setting does.
-- SIDE
+- Side
 
 Only relevant for Single Joycons. Only here because the layouts for L/R differ and the program needs to know that to parse input correctly.
 
@@ -57,7 +60,7 @@ Left/Right - Uses either the left or right joycon's data only.
 
 This setting controls where gyro/accel data will be fed to.
 
-DS4 Raw: Feeds the data directly into the virtual DS4 controller using DS4 axis conventions. May not work in all cases (e.g. if the controller shows up as WGInput instead of SDL).
+DS4 Raw: Feeds the data directly into the virtual DS4 controller using DS4 axis conventions.
 
 DS4 Switch Emu: Same as DS4 Raw, but remaps gyro axes to match Switch controller conventions. Use this if motion controls feel wrong or inverted in your emulator.
 
@@ -97,8 +100,12 @@ Make sure the following are installed via Visual Studio Installer:
     ```sh
     build\Release\testapp.exe
 
-# Joy-Con 2 BLE Notification Research
-(this section is for documenting the Joy-Con 2's behavior and function. if you're just looking to use the program, this section isnt important.)
+--- 
+
+## Other
+
+<details>
+<summary>Joy-Con 2 BLE Notification Layout</summary>
 
 
 This document outlines some findings related to Joy-Con 2 BLE input behavior. If you're developing or reverse-engineering Joy-Con 2, Pro Controller 2, or other supported Nintendo controllers over BLE, this may be useful.
@@ -180,10 +187,10 @@ huge thanks to [@german77](https://github.com/german77) for providing me with th
   → `25 + (3679 / 127) ≈ 54°C`
 - **Battery voltage**:  
 Reported as millivolts. `3000` = 3.0V. If `0x0000`, likely unavailable at that time.
+</details>
 
----
-
-## Latency diagnostics
+<details>
+<summary>Latency Diagnostics</summary>
 
 The test app can write an internal latency CSV while you compare update policies:
 
@@ -206,3 +213,4 @@ mode,controller_type,event_index,ble_delta_ms,buffer_age_left_ms,buffer_age_righ
 ```
 
 For a repeatable manual comparison, run each policy with the same controller, keep it still for 10 seconds, then press one button 30 times at a steady rhythm. Repeat for Single Joy-Con, Dual Joy-Con, and Pro Controller. For perceived end-to-end latency, record the physical controller and gamepad-tester.com or Steam Input at 240 fps, count frames between the visible press and on-screen response, and convert with `latency_ms = frames / fps * 1000`.
+</details>
