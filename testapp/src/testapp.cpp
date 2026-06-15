@@ -1353,7 +1353,7 @@ static void DrawSetupScreen() {
                 } else if (pc.controllerType == ProController) {
                     g_connectionTasks[taskIdx].statusMsg = "Scanning...";
                     bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
+                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok, JoyConSide::Right);
                     if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
                     if (cj.rumbleChar) { SendJoyCon2OfficialInit(cj.rumbleChar); }
@@ -1381,13 +1381,7 @@ static void DrawSetupScreen() {
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
                     if (pc.gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
 
-                    GattCharacteristic proPrimaryVibration = cj.vibrationChar ? cj.vibrationChar : cj.vibrationCharRight;
-                    GattCharacteristic proSecondaryVibration = cj.vibrationCharRight;
-                    if (!cj.vibrationChar && cj.vibrationCharRight) {
-                        proSecondaryVibration = nullptr;
-                    }
-                    
-                    auto* rctx = new SingleRumbleCtx{ proPrimaryVibration, tgt, proSecondaryVibration };
+                    auto* rctx = new SingleRumbleCtx{ cj.vibrationCharLeft, tgt, cj.vibrationCharRight };
                     g_proRumbleCtxs.push_back(rctx);
                     StartSingleRumbleThread(rctx);
 
