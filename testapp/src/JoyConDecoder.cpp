@@ -367,8 +367,8 @@ MotionData DecodeMotionRaw(const std::vector<uint8_t>& buffer)
     motion.accelY = to_signed_16(buffer[0x32], buffer[0x33]);
     motion.accelZ = to_signed_16(buffer[0x34], buffer[0x35]);
     motion.gyroX  = to_signed_16(buffer[0x36], buffer[0x37]);
-    motion.gyroZ  = to_signed_16(buffer[0x38], buffer[0x39]);
-    motion.gyroY  = to_signed_16(buffer[0x3A], buffer[0x3B]);
+    motion.gyroY  = to_signed_16(buffer[0x38], buffer[0x39]);
+    motion.gyroZ  = to_signed_16(buffer[0x3A], buffer[0x3B]);
 
     return motion;
 }
