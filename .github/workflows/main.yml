@@ -1,28 +1,23 @@
 name: Build and Release
-
 on:
   workflow_dispatch:
-
 jobs:
   build:
-    runs-on: windows-latest
-
+    runs-on: windows-2022
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
-
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
       - name: Configure CMake
         run: cmake -B build -S testapp -G "Visual Studio 17 2022" -A x64
-
       - name: Build Release
         run: cmake --build build --config Release
-
       - name: Generate SHA-256 checksum
         run: |
           $hash = Get-FileHash "build\Release\testapp.exe" -Algorithm SHA256
           "$($hash.Hash)  testapp.exe" | Out-File -Encoding ASCII checksums.txt
           Get-Content checksums.txt
-
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -30,7 +25,6 @@ jobs:
           path: |
             build\Release\testapp.exe
             checksums.txt
-
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
