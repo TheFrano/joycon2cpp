@@ -98,8 +98,7 @@ struct PlayerConfig {
     JoyConSide     joyconSide        = JoyConSide::Left;
     JoyConOrientation joyconOrientation = JoyConOrientation::Upright;
     GyroSource     gyroSource        = GyroSource::Both;
-    GyroMode       gyroMode          = GyroMode::DS4Raw;
-    MotionProfile  motionProfile     = MotionProfile::Raw;
+    GyroMode       gyroMode          = GyroMode::Raw;
 };
 
 struct ConnectedJoyCon {
@@ -157,7 +156,6 @@ struct DualJoyConPlayer {
     ConnectedJoyCon leftJoyCon, rightJoyCon;
     GyroSource      gyroSource;
     GyroMode        gyroMode;
-    MotionProfile   motionProfile;
     uint8_t         dsuSlot = 0;
     PVIGEM_TARGET   ds4Controller = nullptr;
     std::atomic<bool> running{false};
@@ -840,9 +838,9 @@ static void UpdateCalibLiveValues() {
     }
 }
 
-static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroMode, MotionProfile motionProfile, uint8_t dsuSlot) {
+static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroMode, uint8_t dsuSlot) {
     player.joycon.inputChar.ValueChanged(
-        [&player, gyroMode, motionProfile, dsuSlot]
+        [&player, gyroMode, dsuSlot]
         (GattCharacteristic const&, GattValueChangedEventArgs const& args)
     {
         if (g_shuttingDown.load()) return;
@@ -918,11 +916,9 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
 
         if (!ShouldEmit(g_opts.updatePolicy, player.latency.lastEmitTime, SteadyClock::now())) return;
         const auto ds = SteadyClock::now();
-        MotionProfile mp = (gyroMode==GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
-        DS4_REPORT_EX report = GenerateDS4Report(buf, player.side, player.orientation, mp);
+        DS4_REPORT_EX report = GenerateDS4Report(buf, player.side, player.orientation);
         if (gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) {
-            DS4_REPORT_EX dr = GenerateDS4Report(buf, player.side, player.orientation, MotionProfile::SwitchEmu);
-            g_dsuServer.UpdateController(dsuSlot, dr);
+            g_dsuServer.UpdateController(dsuSlot, report); 
         }
         if (g_shuttingDown.load() || !g_vigem || !player.ds4Controller) return;
         vigem_target_ds4_update_ex(g_vigem, player.ds4Controller, report);
@@ -1043,12 +1039,11 @@ static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
 
     ImGui::TableSetColumnIndex(5);
     if (cfg.controllerType != NSOGCController) {
-        const char* gm[] = {"DS4 Raw","DS4 Switch Emu","DSU UDP"};
-        int gv = (cfg.gyroMode==GyroMode::DS4Raw)?0:(cfg.gyroMode==GyroMode::DS4SwitchEmu)?1:2;
+        const char* gm[] = {"Raw","DSU UDP"};
+        int gv = (cfg.gyroMode==GyroMode::Raw)?0:1;
         ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##gyromode", &gv, gm, 3)) {
-            cfg.gyroMode = gv==0?GyroMode::DS4Raw:gv==1?GyroMode::DS4SwitchEmu:GyroMode::DsuUdp;
-            cfg.motionProfile = gv==0?MotionProfile::Raw:MotionProfile::SwitchEmu;
+        if (ImGui::Combo("##gyromode", &gv, gm, 2)) {
+            cfg.gyroMode = gv==0?GyroMode::Raw:GyroMode::DsuUdp;
         }
     } else ImGui::TextDisabled("—");
 
@@ -1261,7 +1256,7 @@ static void DrawSetupScreen() {
                     g_singlePlayers.push_back({ cj, t, pc.joyconSide, pc.joyconOrientation });
                     auto& player = g_singlePlayers.back();
                     if (pc.gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
-                    AttachSingleJoyConHandler(player, pc.gyroMode, pc.motionProfile, dsuSlot);
+                    AttachSingleJoyConHandler(player, pc.gyroMode, dsuSlot);
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
 
                     auto* rctx = new SingleRumbleCtx{ cj.vibrationChar, t };
@@ -1291,7 +1286,7 @@ static void DrawSetupScreen() {
                     auto dp = std::make_unique<DualJoyConPlayer>();
                     dp->leftJoyCon=ljc; dp->rightJoyCon=rjc;
                     dp->gyroSource=pc.gyroSource; dp->gyroMode=pc.gyroMode;
-                    dp->motionProfile=pc.motionProfile; dp->dsuSlot=dsuSlot;
+                    dp->dsuSlot=dsuSlot;
                     dp->ds4Controller=AddDS4(); dp->running.store(true);
                     dp->sharedState=std::make_shared<DualJoyConSharedState>();
                     if (dp->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
@@ -1331,11 +1326,9 @@ static void DrawSetupScreen() {
                                 if (!ShouldEmit(g_opts.updatePolicy,ss->lastEmitTime,now)){lastSeq=ss->sequence;continue;}
                                 ls=ss->left; rs=ss->right; lastSeq=ss->sequence;
                             }
-                            MotionProfile mp=(dpptr->gyroMode==GyroMode::DsuUdp)?MotionProfile::Raw:dpptr->motionProfile;
-                            auto report=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,mp);
+                            auto report=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource);
                             if (dpptr->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
-                                auto dr=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,MotionProfile::SwitchEmu);
-                                g_dsuServer.UpdateController(dpptr->dsuSlot,dr);
+                                g_dsuServer.UpdateController(dpptr->dsuSlot,report);
                             }
                             if (g_shuttingDown.load() || !g_vigem || !dpptr->ds4Controller) break;
                             vigem_target_ds4_update_ex(g_vigem,dpptr->ds4Controller,report);
@@ -1359,20 +1352,18 @@ static void DrawSetupScreen() {
                     if (cj.rumbleChar) { SendJoyCon2OfficialInit(cj.rumbleChar); }
                     auto tgt=AddDS4();
                     auto latPtr=std::make_shared<LatencyTracker>();
-                    auto gm=pc.gyroMode; auto mp=pc.motionProfile; uint8_t ds=(uint8_t)dsuSlot;
-                    cj.inputChar.ValueChanged([tgt,gm,mp,ds,latPtr](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
+                    auto gm=pc.gyroMode; uint8_t ds=(uint8_t)dsuSlot;
+                    cj.inputChar.ValueChanged([tgt,gm,ds,latPtr](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
                         if (g_shuttingDown.load()) return;
                         auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
                         FeedCalibBuffer(buf, g_calib.isLeft);
                         double bd=MsBetween(latPtr->lastBleTime,now); latPtr->lastBleTime=now;
                         if (!ShouldEmit(g_opts.updatePolicy,latPtr->lastEmitTime,SteadyClock::now())) return;
-                        auto ds4p=(gm==GyroMode::DsuUdp)?MotionProfile::Raw:mp;
-                        DS4_REPORT_EX report=GenerateProControllerReport(buf,ds4p);
+                        DS4_REPORT_EX report=GenerateProControllerReport(buf);
                         ApplyGLGR(report,buf); HandleSpecialProButtons(buf);
                         if (gm==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
-                            DS4_REPORT_EX dr=GenerateProControllerReport(buf,MotionProfile::SwitchEmu);
-                            ApplyGLGR(dr,buf); g_dsuServer.UpdateController(ds,dr);
+                            ApplyGLGR(report,buf); g_dsuServer.UpdateController(ds,report);
                         }
                         if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         if (g_shuttingDown.load() || !g_vigem || !tgt) return;
