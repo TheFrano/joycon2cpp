@@ -217,16 +217,6 @@ const CalibrationProfile& GetActiveCalibration()
 }
 
 namespace {
-constexpr bool kSwitchEmuInvertPitch = false;
-constexpr bool kSwitchEmuInvertYaw   = true;
-constexpr bool kSwitchEmuInvertRoll  = false;
-constexpr bool kSwitchEmuSwapYawRoll = false;
-
-SHORT ApplySign(SHORT value, bool invert)
-{
-    return invert ? static_cast<SHORT>(-value) : value;
-}
-
 void ApplyMotionToReport(DS4_REPORT_EX& report, const MotionData& motion)
 {
     report.Report.wAccelX = motion.accelX;
@@ -373,23 +363,6 @@ MotionData DecodeMotionRaw(const std::vector<uint8_t>& buffer)
     return motion;
 }
 
-MotionData TransformMotion(MotionData raw, MotionProfile profile, JoyConSide)
-{
-    if (profile == MotionProfile::Raw) return raw;
-
-    MotionData out = raw;
-    SHORT pitch = raw.gyroX;
-    SHORT yaw   = raw.gyroY;
-    SHORT roll  = raw.gyroZ;
-
-    if (kSwitchEmuSwapYawRoll) std::swap(yaw, roll);
-
-    out.gyroX = ApplySign(pitch, kSwitchEmuInvertPitch);
-    out.gyroY = ApplySign(yaw,   kSwitchEmuInvertYaw);
-    out.gyroZ = ApplySign(roll,  kSwitchEmuInvertRoll);
-    return out;
-}
-
 MotionData DecodeMotion(const std::vector<uint8_t>& buffer)
 {
     return DecodeMotionRaw(buffer);
@@ -417,7 +390,7 @@ static std::pair<int16_t, int16_t> decode_calibrated_stick(const uint8_t* data, 
     };
 }
 
-DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation, MotionProfile profile)
+DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation)
 {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
@@ -482,12 +455,12 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
     report.Report.bThumbLX = static_cast<BYTE>((stickX / 32767.0f) * 127 + 128);
     report.Report.bThumbLY = static_cast<BYTE>((stickY / 32767.0f) * 127 + 128);
 
-    ApplyMotionToReport(report, TransformMotion(DecodeMotionRaw(buffer), profile, side));
+    ApplyMotionToReport(report, DecodeMotionRaw(buffer));
 
     return report;
 }
 
-DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer, const std::vector<uint8_t>& rightBuffer, GyroSource gyroSource, MotionProfile profile)
+DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer, const std::vector<uint8_t>& rightBuffer, GyroSource gyroSource)
 {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
@@ -496,11 +469,11 @@ DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer
 
     DS4_REPORT_EX leftReport{};
     if (leftBuffer.size() >= 0x3C)
-        leftReport = GenerateDS4Report(leftBuffer, JoyConSide::Left, JoyConOrientation::Upright, profile);
+        leftReport = GenerateDS4Report(leftBuffer, JoyConSide::Left, JoyConOrientation::Upright);
 
     DS4_REPORT_EX rightReport{};
     if (rightBuffer.size() >= 0x3C)
-        rightReport = GenerateDS4Report(rightBuffer, JoyConSide::Right, JoyConOrientation::Upright, profile);
+        rightReport = GenerateDS4Report(rightBuffer, JoyConSide::Right, JoyConOrientation::Upright);
 
     USHORT leftDpad           = leftReport.Report.wButtons & 0xF;
     USHORT leftButtonsNoDpad  = leftReport.Report.wButtons & ~0xF;
@@ -596,7 +569,7 @@ constexpr uint64_t BUTTON_L_THUMB     = 0x000008000000;
 constexpr uint64_t TRIGGER_LT_MASK    = 0x000000800000;
 constexpr uint64_t TRIGGER_RT_MASK    = 0x008000000000;
 
-DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer, MotionProfile profile)
+DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer)
 {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
@@ -649,7 +622,7 @@ DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer, Mo
     report.Report.bThumbRX = static_cast<uint8_t>((rx / 32767.0f) * 127 + 128);
     report.Report.bThumbRY = static_cast<uint8_t>((ry / 32767.0f) * 127 + 128);
 
-    ApplyMotionToReport(report, TransformMotion(DecodeMotionRaw(buffer), profile, JoyConSide::Right));
+    ApplyMotionToReport(report, DecodeMotionRaw(buffer));
 
     return report;
 }
