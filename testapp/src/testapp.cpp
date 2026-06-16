@@ -63,6 +63,8 @@ const wchar_t* RUMBLE_CHAR_UUID_GC  = L"af95885e-44b3-4a24-9cf0-483cc129469a";
 
 const wchar_t* VIBRATION_CHAR_UUID_L = L"289326cb-a471-485d-a8f4-240c14f18241";
 const wchar_t* VIBRATION_CHAR_UUID_R = L"fa19b0fb-cd1f-46a7-84a1-bbb09e00c149";
+const wchar_t* VIBRATION_CHAR_UUID_PRO = L"cc483f51-9258-427d-a939-630c31f72b05";
+const wchar_t* VIBRATION_CHAR_UUID_GC  = L"3f8fb670-ab25-45bf-b540-38c72834d064";
 
 const std::string CONFIG_FILE = "joycon2cpp_config.json";
 
@@ -181,10 +183,13 @@ struct ConnectionTask {
 };
 
 
+enum class RumbleMode { JoyCon, Pro, GC };
+
 struct SingleRumbleCtx {
     GattCharacteristic  vibrationChar;
     PVIGEM_TARGET       target    = nullptr;
     GattCharacteristic  secondaryVibrationChar = nullptr;
+    RumbleMode          mode      = RumbleMode::JoyCon;
     std::atomic<bool>   running{true};
     std::thread         thread;
 };
@@ -521,8 +526,6 @@ static void SendJoyCon2OfficialInit(GattCharacteristic const& ch)
     }
 }
 
-// Init sequence for Pro Controller 2. Feature flags: 0x2F.
-// No 0x10 command. Reads 0x130C0. One 0x11 command. Vibration data uses 0xFF,0xFF pattern.
 static void SendProCon2OfficialInit(GattCharacteristic const& ch)
 {
     if (!ch || g_shuttingDown.load()) return;
@@ -553,9 +556,7 @@ static void SendProCon2OfficialInit(GattCharacteristic const& ch)
     }
 }
 
-// Init sequence for NSO Gamecube Controller. Feature flags: 0x27.
-// Has 0x10 command. Reads 0x130C0 and an extra 0x02 from 0x13140. One 0x11 command.
-// No second 0x11 before confirm. Vibration data uses 0xFF,0xFF pattern.
+
 static void SendNSOGCOfficialInit(GattCharacteristic const& ch)
 {
     if (!ch || g_shuttingDown.load()) return;
@@ -614,6 +615,40 @@ static void SendRumble(GattCharacteristic const& ch, float amp)
     ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse);
 }
 
+
+static void SendGCRumble(GattCharacteristic const& ch, float amp)
+{
+    if (!ch || g_shuttingDown.load()) return;
+    std::vector<uint8_t> pkt(5, 0x00);
+    if (amp >= 0.01f) {
+        pkt[1] = 0x01;
+        pkt[2] = static_cast<uint8_t>(std::min(amp * 255.f, 255.f));
+    }
+    DataWriter w;
+    w.WriteBytes(pkt);
+    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse);
+}
+
+static void SendProRumble(GattCharacteristic const& ch, float amp)
+{
+    if (!ch || g_shuttingDown.load()) return;
+    static uint8_t c = 0;
+    std::vector<uint8_t> pkt(58, 0x00);
+    if (amp >= 0.01f) {
+        const uint8_t strong[5] = {0x93, 0x35, 0x36, 0x1C, 0x0D};
+        const uint8_t weak[5]   = {0x4B, 0x7D, 0x80, 0x5A, 0x02};
+        const uint8_t* p = amp > 0.5f ? strong : weak;
+        pkt[1] = 0x50 | (c & 0x0F);
+        memcpy(pkt.data() + 2, p, 5); 
+        pkt[17] = 0x50 | (c & 0x0F);
+        memcpy(pkt.data() + 18, p, 5); 
+        c = (c + 1) & 0x0F;
+    }
+    DataWriter w;
+    w.WriteBytes(pkt);
+    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse);
+}
+
 static void SendVibrationSample(GattCharacteristic const& ch, uint8_t sampleId)
 {
     std::vector<uint8_t> data(4, 0);
@@ -631,15 +666,27 @@ static void StartSingleRumbleThread(SingleRumbleCtx* ctx) {
             if (VIGEM_SUCCESS(err)) {
                 float amp = std::max(out.LargeMotor, out.SmallMotor) / 255.0f;
                 if (amp >= 0.01f) {
-                    SendRumble(ctx->vibrationChar, amp);
-                    if (ctx->secondaryVibrationChar)
-                        SendRumble(ctx->secondaryVibrationChar, amp);
+                    if (ctx->mode == RumbleMode::GC) {
+                        SendGCRumble(ctx->vibrationChar, amp);
+                    } else if (ctx->mode == RumbleMode::Pro) {
+                        SendProRumble(ctx->vibrationChar, amp);
+                    } else {
+                        SendRumble(ctx->vibrationChar, amp);
+                        if (ctx->secondaryVibrationChar)
+                            SendRumble(ctx->secondaryVibrationChar, amp);
+                    }
                     silentFrames = 0;
                 } else {
                     if (silentFrames == 0) {
-                        SendRumble(ctx->vibrationChar, 0.0f);
-                        if (ctx->secondaryVibrationChar)
-                            SendRumble(ctx->secondaryVibrationChar, 0.0f);
+                        if (ctx->mode == RumbleMode::GC) {
+                            SendGCRumble(ctx->vibrationChar, 0.0f);
+                        } else if (ctx->mode == RumbleMode::Pro) {
+                            SendProRumble(ctx->vibrationChar, 0.0f);
+                        } else {
+                            SendRumble(ctx->vibrationChar, 0.0f);
+                            if (ctx->secondaryVibrationChar)
+                                SendRumble(ctx->secondaryVibrationChar, 0.0f);
+                        }
                     }
                     silentFrames++;
                 }
@@ -818,6 +865,12 @@ static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> status
             if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_R)) {
                 cj.vibrationCharRight = ch;
                 if (side == JoyConSide::Right) cj.vibrationChar = ch;
+            }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_PRO)) {
+                cj.vibrationChar = ch;
+            }
+            if (ch.Uuid() == guid(VIBRATION_CHAR_UUID_GC)) {
+                cj.vibrationChar = ch;
             }
         }
     }
@@ -1506,7 +1559,7 @@ static void DrawSetupScreen() {
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
                     if (pc.gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
 
-                    auto* rctx = new SingleRumbleCtx{ cj.vibrationCharLeft, tgt, cj.vibrationCharRight };
+                    auto* rctx = new SingleRumbleCtx{ cj.rumbleChar, tgt, nullptr, RumbleMode::Pro };
                     g_proRumbleCtxs.push_back(rctx);
                     StartSingleRumbleThread(rctx);
 
@@ -1532,6 +1585,11 @@ static void DrawSetupScreen() {
                         vigem_target_ds4_update_ex(g_vigem,tgt,report);
                     });
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
+
+                    auto* rctx = new SingleRumbleCtx{ cj.vibrationChar, tgt, nullptr, RumbleMode::GC };
+                    g_proRumbleCtxs.push_back(rctx);
+                    StartSingleRumbleThread(rctx);
+
                     g_proPlayers.push_back({cj,tgt});
                     AppLog("Player " + std::to_string(pi+1) + " NSO GC connected");
                     ++taskIdx; ++dsuSlot;
