@@ -217,6 +217,17 @@ const CalibrationProfile& GetActiveCalibration()
 }
 
 namespace {
+constexpr size_t JC2_COMMON_REPORT_MIN_SIZE = 0x3C;
+constexpr size_t JC2_COMMON_REPORT_MARKER_OFFSET = 0x29;
+constexpr uint8_t JC2_COMMON_REPORT_MARKER_VALUE = 0x01;
+
+constexpr size_t JC2_ACCEL_X_OFFSET = 0x30;
+constexpr size_t JC2_ACCEL_Y_OFFSET = 0x32;
+constexpr size_t JC2_ACCEL_Z_OFFSET = 0x34;
+constexpr size_t JC2_GYRO_X_OFFSET  = 0x36;
+constexpr size_t JC2_GYRO_Y_OFFSET  = 0x38;
+constexpr size_t JC2_GYRO_Z_OFFSET  = 0x3A;
+
 void ApplyMotionToReport(DS4_REPORT_EX& report, const MotionData& motion)
 {
     report.Report.wAccelX = motion.accelX;
@@ -245,6 +256,45 @@ float ApplyCalibratedAxis(int raw, int center, int minVal, int maxVal)
     }
     return std::clamp(result, -1.0f, 1.0f);
 }
+
+
+int16_t ReadS16LE(const std::vector<uint8_t>& buffer, size_t offset)
+{
+    return to_signed_16(buffer[offset], buffer[offset + 1]);
+}
+
+bool LooksLikeCommonInputReport05(const std::vector<uint8_t>& buffer)
+{
+    return buffer.size() >= JC2_COMMON_REPORT_MIN_SIZE &&
+           buffer[JC2_COMMON_REPORT_MARKER_OFFSET] == JC2_COMMON_REPORT_MARKER_VALUE;
+}
+
+bool TryDecodeCommonInputReport05Motion(const std::vector<uint8_t>& buffer, MotionData& raw)
+{
+    if (!LooksLikeCommonInputReport05(buffer)) {
+        return false;
+    }
+
+    bool allMotionBytesZero = true;
+    for (size_t i = JC2_ACCEL_X_OFFSET; i <= JC2_GYRO_Z_OFFSET + 1; ++i) {
+        if (buffer[i] != 0) {
+            allMotionBytesZero = false;
+            break;
+        }
+    }
+    if (allMotionBytesZero) {
+        return false;
+    }
+
+    raw.accelX = ReadS16LE(buffer, JC2_ACCEL_X_OFFSET);
+    raw.accelY = ReadS16LE(buffer, JC2_ACCEL_Y_OFFSET);
+    raw.accelZ = ReadS16LE(buffer, JC2_ACCEL_Z_OFFSET);
+    raw.gyroX  = ReadS16LE(buffer, JC2_GYRO_X_OFFSET);
+    raw.gyroY  = ReadS16LE(buffer, JC2_GYRO_Y_OFFSET);
+    raw.gyroZ  = ReadS16LE(buffer, JC2_GYRO_Z_OFFSET);
+    return true;
+}
+
 }
 
 constexpr uint32_t BUTTON_A_MASK_RIGHT    = 0x000800;
@@ -350,17 +400,12 @@ static void decode_triggers_shoulders(uint32_t state, bool isLeft, bool upright,
 
 MotionData DecodeMotionRaw(const std::vector<uint8_t>& buffer)
 {
-    MotionData motion{};
-    if (buffer.size() < 0x3C) return motion;
+    MotionData raw{};
 
-    motion.accelX = to_signed_16(buffer[0x30], buffer[0x31]);
-    motion.accelY = to_signed_16(buffer[0x32], buffer[0x33]);
-    motion.accelZ = to_signed_16(buffer[0x34], buffer[0x35]);
-    motion.gyroX  = to_signed_16(buffer[0x36], buffer[0x37]);
-    motion.gyroY  = to_signed_16(buffer[0x38], buffer[0x39]);
-    motion.gyroZ  = to_signed_16(buffer[0x3A], buffer[0x3B]);
-
-    return motion;
+    if (!TryDecodeCommonInputReport05Motion(buffer, raw)) {
+        return MotionData{};
+    }
+    return raw;
 }
 
 MotionData DecodeMotion(const std::vector<uint8_t>& buffer)
