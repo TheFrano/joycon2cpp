@@ -597,9 +597,9 @@ DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer
 }
 
 constexpr uint64_t BUTTON_A_MASK      = 0x000800000000;
-constexpr uint64_t BUTTON_B_MASK      = 0x000400000000;
+constexpr uint64_t BUTTON_B_MASK      = 0x000100000000;
 constexpr uint64_t BUTTON_X_MASK      = 0x000200000000;
-constexpr uint64_t BUTTON_Y_MASK      = 0x000100000000;
+constexpr uint64_t BUTTON_Y_MASK      = 0x000400000000;
 constexpr uint64_t BUTTON_R_SHOULDER  = 0x004000000000;
 constexpr uint64_t BUTTON_L_SHOULDER  = 0x000000400000;
 constexpr uint64_t BUTTON_DPAD_UP     = 0x000000020000;
