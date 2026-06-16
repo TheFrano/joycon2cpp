@@ -614,47 +614,115 @@ static void StartDualRumbleThread(DualRumbleCtx* ctx) {
 }
 
 
+static bool TryParseSwitch2ControllerAd(const std::vector<uint8_t>& d, uint16_t& productId)
+{
+    if (d.size() < 7) return false;
+    if (d[0] != 0x01 || d[1] != 0x00 || d[2] != 0x03) return false;
+    if (d[3] != 0x7E || d[4] != 0x05) return false;
+
+    productId = static_cast<uint16_t>(d[5] | (static_cast<uint16_t>(d[6]) << 8));
+    return productId >= 0x2060;
+}
+
 static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> statusCb, bool& outSuccess, JoyConSide side = JoyConSide::Left) {
     outSuccess = false;
     ConnectedJoyCon cj{};
     BluetoothLEDevice device = nullptr;
-    bool found = false;
-    BluetoothLEAdvertisementWatcher watcher;
-    std::mutex mtx; std::condition_variable cv;
 
-    watcher.Received([&](auto const&, auto const& args) {
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool found = false;
+    uint64_t foundAddress = 0;
+    uint16_t foundProductId = 0;
+    int16_t foundRssi = 0;
+
+    BluetoothLEAdvertisementWatcher watcher;
+    watcher.ScanningMode(BluetoothLEScanningMode::Passive);
+    auto token = watcher.Received([&](auto const&, auto const& args) {
         if (g_shuttingDown.load()) return;
-        std::unique_lock<std::mutex> lk(mtx);
-        if (found) return;
-        auto mfg = args.Advertisement().ManufacturerData();
-        for (uint32_t i = 0; i < mfg.Size(); i++) {
-            auto sec = mfg.GetAt(i);
-            if (sec.CompanyId() != JOYCON_MANUFACTURER_ID) continue;
-            auto rdr = DataReader::FromBuffer(sec.Data());
-            std::vector<uint8_t> d(rdr.UnconsumedBufferLength());
-            rdr.ReadBytes(d);
-            if (d.size() >= JOYCON_MANUFACTURER_PREFIX.size() &&
-                std::equal(JOYCON_MANUFACTURER_PREFIX.begin(), JOYCON_MANUFACTURER_PREFIX.end(), d.begin())) {
-                device = BluetoothLEDevice::FromBluetoothAddressAsync(args.BluetoothAddress()).get();
-                if (!device) return;
-                found = true; watcher.Stop(); cv.notify_one();
+
+        uint16_t productId = 0;
+        bool match = false;
+
+        try {
+            auto mfg = args.Advertisement().ManufacturerData();
+            for (uint32_t i = 0; i < mfg.Size(); i++) {
+                auto sec = mfg.GetAt(i);
+                if (sec.CompanyId() != JOYCON_MANUFACTURER_ID) continue;
+
+                auto rdr = DataReader::FromBuffer(sec.Data());
+                std::vector<uint8_t> d(rdr.UnconsumedBufferLength());
+                rdr.ReadBytes(d);
+
+                if (TryParseSwitch2ControllerAd(d, productId)) {
+                    match = true;
+                    break;
+                }
             }
+        } catch (...) {
+            return;
         }
+
+        if (!match) return;
+
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (found) return;
+            found = true;
+            foundAddress = args.BluetoothAddress();
+            foundProductId = productId;
+            foundRssi = args.RawSignalStrengthInDBm();
+        }
+        cv.notify_one();
     });
-    watcher.ScanningMode(BluetoothLEScanningMode::Active);
-    watcher.Start();
+
     statusCb("Scanning... (hold sync button)");
+    try {
+        watcher.Start();
+    } catch (...) {
+        statusCb("BLE scan failed to start");
+        return cj;
+    }
+
     {
         std::unique_lock<std::mutex> lk(mtx);
         if (!cv.wait_for(lk, std::chrono::seconds(30), [&]{ return found || g_shuttingDown.load(); })) {
             watcher.Stop();
-            statusCb(g_shuttingDown.load() ? "Cancelled" : "Timed out — device not found");
+            watcher.Received(token);
+            statusCb("Timed out — device not found");
             return cj;
         }
-        if (g_shuttingDown.load()) { watcher.Stop(); statusCb("Cancelled"); return cj; }
     }
-    statusCb("Device found, fetching GATT services...");
+
+    watcher.Stop();
+    watcher.Received(token);
+
+    if (g_shuttingDown.load()) {
+        statusCb("Cancelled");
+        return cj;
+    }
+
+    {
+        char tmp[160];
+        sprintf_s(tmp, "Found advertisement PID 0x%04X RSSI %d, opening device...", foundProductId, (int)foundRssi);
+        statusCb(tmp);
+    }
+
+    try {
+        device = BluetoothLEDevice::FromBluetoothAddressAsync(foundAddress).get();
+    } catch (...) {
+        statusCb("Failed to open BLE device");
+        return cj;
+    }
+
+    if (!device) {
+        statusCb("BLE device opened as null");
+        return cj;
+    }
+
+    statusCb("Device opened, fetching GATT services...");
     cj.device = device;
+
     GattDeviceServicesResult sr = nullptr;
     for (int att = 1; att <= 10; ++att) {
         sr = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
@@ -663,7 +731,7 @@ static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> status
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     if (!sr || sr.Status() != GattCommunicationStatus::Success) {
-        statusCb("Failed to get GATT services. Re-pair the device.");
+        statusCb("Failed to get GATT services. Re-pair/forget the device.");
         return cj;
     }
     for (auto svc : sr.Services()) {
@@ -688,7 +756,7 @@ static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> status
         }
     }
     if (!cj.inputChar || !cj.writeChar) {
-        statusCb("Required GATT characteristics not found. Re-pair.");
+        statusCb("Required GATT characteristics not found. Re-pair/forget the device.");
         return cj;
     }
 
