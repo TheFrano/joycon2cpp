@@ -435,7 +435,7 @@ static std::pair<int16_t, int16_t> decode_calibrated_stick(const uint8_t* data, 
     };
 }
 
-DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation)
+DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation, DpadMode dpadMode, RemapSideways remapSideways)
 {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
@@ -444,6 +444,7 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
 
     bool isLeft = (side == JoyConSide::Left);
     bool upright = (orientation == JoyConOrientation::Upright);
+    bool remap = !upright && (remapSideways == RemapSideways::Yes);
 
     int btnOffset = isLeft ? 4 : 3;
     uint32_t state = (buffer[btnOffset] << 16) | (buffer[btnOffset + 1] << 8) | buffer[btnOffset + 2];
@@ -451,21 +452,33 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
     auto [stickX, stickY] = decode_joystick(buffer, isLeft, upright);
 
     if (isLeft) {
-        bool up    = (state & BUTTON_UP_MASK_LEFT) != 0;
-        bool down  = (state & BUTTON_DOWN_MASK_LEFT) != 0;
-        bool left  = (state & BUTTON_LEFT_MASK_LEFT) != 0;
-        bool right = (state & BUTTON_RIGHT_MASK_LEFT) != 0;
+        bool physUp    = (state & BUTTON_UP_MASK_LEFT) != 0;
+        bool physDown  = (state & BUTTON_DOWN_MASK_LEFT) != 0;
+        bool physLeft  = (state & BUTTON_LEFT_MASK_LEFT) != 0;
+        bool physRight = (state & BUTTON_RIGHT_MASK_LEFT) != 0;
+        bool up    = remap ? physRight : physUp;
+        bool down  = remap ? physLeft  : physDown;
+        bool left  = remap ? physUp    : physLeft;
+        bool right = remap ? physDown  : physRight;
 
+        const bool mapDpad = (dpadMode == DpadMode::On);
         uint8_t dpad = DS4_BUTTON_DPAD_NONE;
-        if      (up && left)   dpad = DS4_BUTTON_DPAD_NORTHWEST;
-        else if (up && right)  dpad = DS4_BUTTON_DPAD_NORTHEAST;
-        else if (down && left) dpad = DS4_BUTTON_DPAD_SOUTHWEST;
-        else if (down && right)dpad = DS4_BUTTON_DPAD_SOUTHEAST;
-        else if (up)           dpad = DS4_BUTTON_DPAD_NORTH;
-        else if (down)         dpad = DS4_BUTTON_DPAD_SOUTH;
-        else if (left)         dpad = DS4_BUTTON_DPAD_WEST;
-        else if (right)        dpad = DS4_BUTTON_DPAD_EAST;
-
+        if (mapDpad) {
+            if      (up && left)   dpad = DS4_BUTTON_DPAD_NORTHWEST;
+            else if (up && right)  dpad = DS4_BUTTON_DPAD_NORTHEAST;
+            else if (down && left) dpad = DS4_BUTTON_DPAD_SOUTHWEST;
+            else if (down && right)dpad = DS4_BUTTON_DPAD_SOUTHEAST;
+            else if (up)           dpad = DS4_BUTTON_DPAD_NORTH;
+            else if (down)         dpad = DS4_BUTTON_DPAD_SOUTH;
+            else if (left)         dpad = DS4_BUTTON_DPAD_WEST;
+            else if (right)        dpad = DS4_BUTTON_DPAD_EAST;
+        } else {
+            if (down)  report.Report.wButtons |= DS4_BUTTON_CROSS;
+            if (right) report.Report.wButtons |= DS4_BUTTON_CIRCLE;
+            if (left)  report.Report.wButtons |= DS4_BUTTON_SQUARE;
+            if (up)    report.Report.wButtons |= DS4_BUTTON_TRIANGLE;
+        }
+        
         DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), static_cast<DS4_DPAD_DIRECTIONS>(dpad));
 
         if (state & BUTTON_MINUS_MASK_LEFT)  report.Report.wButtons |= DS4_BUTTON_SHARE;
@@ -473,11 +486,17 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
         if (state & BUTTON_STICK_MASK_LEFT)  report.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;
     } else {
         DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_NONE);
-
-        if (state & BUTTON_A_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_CIRCLE;
-        if (state & BUTTON_B_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_TRIANGLE;
-        if (state & BUTTON_X_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_CROSS;
-        if (state & BUTTON_Y_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_SQUARE;
+        if (remap) {
+            if (state & BUTTON_A_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_CROSS;
+            if (state & BUTTON_B_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_CIRCLE;
+            if (state & BUTTON_X_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_SQUARE;
+            if (state & BUTTON_Y_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_TRIANGLE;
+        } else {
+            if (state & BUTTON_A_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_CIRCLE;
+            if (state & BUTTON_B_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_TRIANGLE;
+            if (state & BUTTON_X_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_CROSS;
+            if (state & BUTTON_Y_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_SQUARE;
+        }
         if (state & BUTTON_PLUS_MASK_RIGHT)  report.Report.wButtons |= DS4_BUTTON_OPTIONS;
         if (state & BUTTON_R_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;
         if (state & BUTTON_STICK_MASK_RIGHT) report.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;
@@ -505,7 +524,7 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
     return report;
 }
 
-DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer, const std::vector<uint8_t>& rightBuffer, GyroSource gyroSource)
+DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer, const std::vector<uint8_t>& rightBuffer, GyroSource gyroSource, DpadMode leftDpadMode)
 {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
@@ -514,7 +533,7 @@ DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer
 
     DS4_REPORT_EX leftReport{};
     if (leftBuffer.size() >= 0x3C)
-        leftReport = GenerateDS4Report(leftBuffer, JoyConSide::Left, JoyConOrientation::Upright);
+        leftReport = GenerateDS4Report(leftBuffer, JoyConSide::Left, JoyConOrientation::Upright, leftDpadMode);
 
     DS4_REPORT_EX rightReport{};
     if (rightBuffer.size() >= 0x3C)
@@ -730,6 +749,23 @@ DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer)
     ApplyMotionToReport(report, DecodeMotionRaw(buffer));
 
     return report;
+}
+
+void ApplySwapABXY(DS4_REPORT_EX& report)
+{
+    USHORT& buttons = report.Report.wButtons;
+
+    bool a = (buttons & DS4_BUTTON_CIRCLE)   != 0;
+    bool b = (buttons & DS4_BUTTON_CROSS)    != 0;
+    bool x = (buttons & DS4_BUTTON_TRIANGLE) != 0;
+    bool y = (buttons & DS4_BUTTON_SQUARE)   != 0;
+
+    buttons &= ~(DS4_BUTTON_CIRCLE | DS4_BUTTON_CROSS | DS4_BUTTON_TRIANGLE | DS4_BUTTON_SQUARE);
+
+    if (b) buttons |= DS4_BUTTON_CIRCLE;
+    if (a) buttons |= DS4_BUTTON_CROSS;
+    if (y) buttons |= DS4_BUTTON_TRIANGLE;
+    if (x) buttons |= DS4_BUTTON_SQUARE;
 }
 
 uint32_t ExtractButtonState(const std::vector<uint8_t>& buffer)
