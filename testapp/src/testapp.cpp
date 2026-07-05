@@ -97,6 +97,7 @@ struct RuntimeOptions {
     bool latencyMetrics = false;
     UpdatePolicy updatePolicy = UpdatePolicy::LowLatency;
     char latencyCsvPath[256] = "latency_benchmark.csv";
+    bool swapABXY = false;
 };
 
 struct PlayerConfig {
@@ -105,6 +106,9 @@ struct PlayerConfig {
     JoyConOrientation joyconOrientation = JoyConOrientation::Upright;
     GyroSource     gyroSource        = GyroSource::Both;
     GyroMode       gyroMode          = GyroMode::Raw;
+    bool           mouseEnabled      = true;  
+    DpadMode       dpadMode          = DpadMode::On; 
+    RemapSideways  remapSideways     = RemapSideways::No; 
 };
 
 struct ConnectedJoyCon {
@@ -148,6 +152,9 @@ struct SingleJoyConPlayer {
     PVIGEM_TARGET   ds4Controller = nullptr;
     JoyConSide      side;
     JoyConOrientation orientation;
+    bool            mouseEnabled   = true;
+    DpadMode        dpadMode       = DpadMode::On;
+    RemapSideways   remapSideways  = RemapSideways::No;
     int             mouseMode      = 0;
     bool            wasChatPressed = false;
     int16_t         lastOpticalX   = 0, lastOpticalY = 0;
@@ -162,6 +169,7 @@ struct DualJoyConPlayer {
     ConnectedJoyCon leftJoyCon, rightJoyCon;
     GyroSource      gyroSource;
     GyroMode        gyroMode;
+    DpadMode        leftDpadMode = DpadMode::On;
     uint8_t         dsuSlot = 0;
     PVIGEM_TARGET   ds4Controller = nullptr;
     std::atomic<bool> running{false};
@@ -210,7 +218,7 @@ static PVIGEM_CLIENT          g_vigem         = nullptr;
 static DsuServer              g_dsuServer;
 
 static std::vector<PlayerConfig>                    g_playerConfigs;
-static std::vector<SingleJoyConPlayer>              g_singlePlayers;
+static std::vector<std::unique_ptr<SingleJoyConPlayer>> g_singlePlayers;
 static std::vector<std::unique_ptr<DualJoyConPlayer>> g_dualPlayers;
 static std::vector<ProControllerPlayer>             g_proPlayers;
 
@@ -1047,7 +1055,7 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
         const double bleDelta = MsBetween(player.latency.lastBleTime, now);
         player.latency.lastBleTime = now;
 
-        if (player.side == JoyConSide::Right) {
+        if (player.side == JoyConSide::Right && player.mouseEnabled) {
             uint32_t btnState = ExtractButtonState(buf);
             bool chatPressed = (btnState & 0x000040) != 0;
             if (chatPressed && !player.wasChatPressed) {
@@ -1109,7 +1117,8 @@ static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroM
 
         if (!ShouldEmit(g_opts.updatePolicy, player.latency.lastEmitTime, SteadyClock::now())) return;
         const auto ds = SteadyClock::now();
-        DS4_REPORT_EX report = GenerateDS4Report(buf, player.side, player.orientation);
+        DS4_REPORT_EX report = GenerateDS4Report(buf, player.side, player.orientation, player.dpadMode, player.remapSideways);
+        if (g_opts.swapABXY) ApplySwapABXY(report);
         if (gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) {
             g_dsuServer.UpdateController(dsuSlot, report); 
         }
@@ -1240,6 +1249,36 @@ static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
         }
     } else ImGui::TextDisabled("—");
 
+    ImGui::TableSetColumnIndex(6);
+    if (cfg.controllerType == SingleJoyCon) {
+        ImGui::SetNextItemWidth(-1);
+        ImGui::Checkbox("##mouse", &cfg.mouseEnabled);
+    } else ImGui::TextDisabled("—");
+
+    ImGui::TableSetColumnIndex(7);
+    const bool leftJoyConDpadApplies =
+        (cfg.controllerType == SingleJoyCon && cfg.joyconSide == JoyConSide::Left) ||
+        cfg.controllerType == DualJoyCon;
+    if (leftJoyConDpadApplies) {
+        const char* dp[] = {"Off","On"};
+        int dv = (cfg.dpadMode==DpadMode::Off)?0:1;
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Combo("##dpad", &dv, dp, 2))
+            cfg.dpadMode = dv==0?DpadMode::Off:DpadMode::On;
+    } else ImGui::TextDisabled("—");
+
+
+    ImGui::TableSetColumnIndex(8);
+    const bool remapApplies = (cfg.controllerType == SingleJoyCon) &&
+        (cfg.joyconOrientation == JoyConOrientation::Sideways);
+    if (remapApplies) {
+        bool remapChecked = (cfg.remapSideways == RemapSideways::Yes);
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::Checkbox("##remap", &remapChecked))
+            cfg.remapSideways = remapChecked ? RemapSideways::Yes : RemapSideways::No;
+    } else ImGui::TextDisabled("—");
+
+
     ImGui::PopID();
 }
 
@@ -1256,7 +1295,7 @@ static void DrawSetupScreen() {
 
     if (ImGui::CollapsingHeader("Players", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Spacing();
-        if (ImGui::BeginTable("players", 6,
+        if (ImGui::BeginTable("players", 9,
             ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn("Player",       ImGuiTableColumnFlags_WidthFixed, 60);
             ImGui::TableSetupColumn("Type",         ImGuiTableColumnFlags_WidthStretch, 1.4f);
@@ -1264,6 +1303,9 @@ static void DrawSetupScreen() {
             ImGui::TableSetupColumn("Orientation",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
             ImGui::TableSetupColumn("Gyro Source",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
             ImGui::TableSetupColumn("Gyro Output",  ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("Mouse",        ImGuiTableColumnFlags_WidthStretch, 0.7f);
+            ImGui::TableSetupColumn("D-Pad",        ImGuiTableColumnFlags_WidthStretch, 1.1f);
+            ImGui::TableSetupColumn("Remap",        ImGuiTableColumnFlags_WidthStretch, 0.9f);
             ImGui::TableHeadersRow();
 
             for (int i = 0; i < (int)g_playerConfigs.size(); ++i)
@@ -1296,6 +1338,9 @@ static void DrawSetupScreen() {
             ImGui::SetNextItemWidth(300);
             ImGui::InputText("CSV path", g_opts.latencyCsvPath, sizeof(g_opts.latencyCsvPath));
         }
+
+        ImGui::Checkbox("Swap A/B and X/Y buttons", &g_opts.swapABXY);
+        ImGui::SameLine(); HelpMarker("Swaps Nintendo A<->B and X<->Y for every connected controller (Single JoyCon, Dual JoyCon, Pro Controller, and NSO GC).");
 
         ImGui::Unindent(10);
         ImGui::Spacing();
@@ -1446,8 +1491,16 @@ static void DrawSetupScreen() {
                     g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
                     if (cj.rumbleChar) { SendJoyCon2OfficialInit(cj.rumbleChar); }
                     auto t = AddDS4();
-                    g_singlePlayers.push_back({ cj, t, pc.joyconSide, pc.joyconOrientation });
-                    auto& player = g_singlePlayers.back();
+                    auto sp = std::make_unique<SingleJoyConPlayer>();
+                    sp->joycon = cj;
+                    sp->ds4Controller = t;
+                    sp->side = pc.joyconSide;
+                    sp->orientation = pc.joyconOrientation;
+                    sp->mouseEnabled = pc.mouseEnabled;
+                    sp->dpadMode = pc.dpadMode;
+                    sp->remapSideways = pc.remapSideways;
+                    g_singlePlayers.push_back(std::move(sp));
+                    auto& player = *g_singlePlayers.back();
                     if (pc.gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
                     AttachSingleJoyConHandler(player, pc.gyroMode, dsuSlot);
                     cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
@@ -1478,7 +1531,7 @@ static void DrawSetupScreen() {
 
                     auto dp = std::make_unique<DualJoyConPlayer>();
                     dp->leftJoyCon=ljc; dp->rightJoyCon=rjc;
-                    dp->gyroSource=pc.gyroSource; dp->gyroMode=pc.gyroMode;
+                    dp->gyroSource=pc.gyroSource; dp->gyroMode=pc.gyroMode; dp->leftDpadMode=pc.dpadMode;
                     dp->dsuSlot=dsuSlot;
                     dp->ds4Controller=AddDS4(); dp->running.store(true);
                     dp->sharedState=std::make_shared<DualJoyConSharedState>();
@@ -1519,7 +1572,8 @@ static void DrawSetupScreen() {
                                 if (!ShouldEmit(g_opts.updatePolicy,ss->lastEmitTime,now)){lastSeq=ss->sequence;continue;}
                                 ls=ss->left; rs=ss->right; lastSeq=ss->sequence;
                             }
-                            auto report=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource);
+                            auto report=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,dpptr->leftDpadMode);
+                            if (g_opts.swapABXY) ApplySwapABXY(report);
                             if (dpptr->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
                                 g_dsuServer.UpdateController(dpptr->dsuSlot,report);
                             }
@@ -1555,6 +1609,7 @@ static void DrawSetupScreen() {
                         if (!ShouldEmit(g_opts.updatePolicy,latPtr->lastEmitTime,SteadyClock::now())) return;
                         DS4_REPORT_EX report=GenerateProControllerReport(buf);
                         ApplyGLGR(report,buf); HandleSpecialProButtons(buf);
+                        if (g_opts.swapABXY) ApplySwapABXY(report);
                         if (gm==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
                             ApplyGLGR(report,buf); g_dsuServer.UpdateController(ds,report);
                         }
@@ -1586,6 +1641,7 @@ static void DrawSetupScreen() {
                         auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
                         DS4_REPORT_EX report=GenerateNSOGCReport(buf);
+                        if (g_opts.swapABXY) ApplySwapABXY(report);
                         if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         if (g_shuttingDown.load() || !g_vigem || !tgt) return;
                         vigem_target_ds4_update_ex(g_vigem,tgt,report);
@@ -1804,7 +1860,7 @@ static void DrawRunningScreen() {
     if (ImGui::CollapsingHeader("Connected Controllers", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent(10);
         for (int i=0; i<(int)g_singlePlayers.size(); ++i) {
-            auto& p=g_singlePlayers[i];
+            auto& p=*g_singlePlayers[i];
             ImGui::BulletText("Single JoyCon (%s, %s)",
                 p.side==JoyConSide::Left?"Left":"Right",
                 p.orientation==JoyConOrientation::Upright?"Upright":"Sideways");
@@ -2009,10 +2065,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             }
         }
         for (auto& sp : g_singlePlayers) {
-            if (sp.ds4Controller) {
-                vigem_target_remove(g_vigem, sp.ds4Controller);
-                vigem_target_free(sp.ds4Controller);
-                sp.ds4Controller = nullptr;
+            if (sp && sp->ds4Controller) {
+                vigem_target_remove(g_vigem, sp->ds4Controller);
+                vigem_target_free(sp->ds4Controller);
+                sp->ds4Controller = nullptr;
             }
         }
         for (auto& pp : g_proPlayers) {
