@@ -1256,7 +1256,9 @@ static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
     } else ImGui::TextDisabled("—");
 
     ImGui::TableSetColumnIndex(7);
-    const bool leftJoyConDpadApplies = (cfg.controllerType == SingleJoyCon && cfg.joyconSide == JoyConSide::Left);
+    const bool leftJoyConDpadApplies =
+        (cfg.controllerType == SingleJoyCon && cfg.joyconSide == JoyConSide::Left) ||
+        cfg.controllerType == DualJoyCon;
     if (leftJoyConDpadApplies) {
         const char* dp[] = {"Off","On"};
         int dv = (cfg.dpadMode==DpadMode::Off)?0:1;
@@ -1921,6 +1923,10 @@ static void DrawRunningScreen() {
         ImGui::SetNextItemWidth(200);
         if (ImGui::Combo("Update Policy##run",&pol,policies,3))
             g_opts.updatePolicy=(UpdatePolicy)pol;
+
+        ImGui::Checkbox("Swap A/B and X/Y buttons##run", &g_opts.swapABXY);
+        ImGui::SameLine(); HelpMarker("Swaps Nintendo A<->B and X<->Y for every connected controller. Takes effect immediately.");
+
         ImGui::Unindent(10); ImGui::Spacing();
     }
 
