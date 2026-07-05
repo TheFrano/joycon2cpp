@@ -1257,8 +1257,7 @@ static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
 
     ImGui::TableSetColumnIndex(7);
     const bool leftJoyConDpadApplies =
-        (cfg.controllerType == SingleJoyCon && cfg.joyconSide == JoyConSide::Left) ||
-        cfg.controllerType == DualJoyCon;
+        (cfg.controllerType == SingleJoyCon && cfg.joyconSide == JoyConSide::Left)
     if (leftJoyConDpadApplies) {
         const char* dp[] = {"Off","On"};
         int dv = (cfg.dpadMode==DpadMode::Off)?0:1;
