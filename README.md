@@ -36,37 +36,6 @@ You're free to make your own macOS/Linux fork if you want.
 - Rumble is not supported for the NSOGC Controller
 - (pro controller rumble is untested! let me know if it doesnt work!!!)
 
-## In-App Settings
-This section details what each setting does.
-- Side
-
-Only relevant for Single Joycons. Only here because the layouts for L/R differ and the program needs to know that to parse input correctly.
-
-Left/Right - Left/Right Joycon
-- Orientation
-
-The orientation of Single Joycons.
-
-Upright/Sideways - Upright/Sideways orientation
-
-- Gyro Source
-  
-Controls what controller's gyro/accel data to use. Dual Joycon only.
-
-Both - Uses both joycons.
-
-Left/Right - Uses either the left or right joycon's data only.
-
-- Gyro Output
-
-This setting controls where gyro/accel data will be fed to.
-
-DS4 Raw: Feeds the data directly into the virtual DS4 controller using DS4 axis conventions.
-
-DS4 Switch Emu: Same as DS4 Raw, but remaps gyro axes to match Switch controller conventions. Use this if motion controls feel wrong or inverted in your emulator.
-
-DSU UDP: Sends gyro/accel data over the DSU protocol to a local DSU client. Uses the standard DSU server address (127.0.0.1, port 26760), compatible with Dolphin, Cemu, and other DSU-supporting emulators.
-
 ## Building from source
 
 If you want to build the project yourself, follow these instructions (Windows + Visual Studio):
@@ -104,6 +73,36 @@ Make sure the following are installed via Visual Studio Installer:
 --- 
 
 ## Other
+
+<details>
+<summary>In-App Settings</summary>
+This section details what each setting does.
+  
+## CONTROLLER SETTINGS (the settings on each player's controller)
+- Side (Single Joycons)
+  Details the side this joycon is. (L/R)
+  
+- Orientation (Single Joycons)
+Details what orientation this joycon is. (Upright/Sideways)
+
+- Gyro Source (Dual Joycons)
+  
+Controls what joycon's gyro/accel data to use.
+
+- Gyro Output
+
+This setting controls where gyro/accel data will be fed to.
+
+DS4 Raw: Feeds the data directly into the virtual DS4 controller using DS4 axis conventions.
+
+DS4 Switch Emu: Same as DS4 Raw, but remaps gyro axes to match Switch controller conventions. Use this if motion controls feel wrong or inverted in your emulator.
+
+DSU UDP: Sends gyro/accel data over the DSU protocol to a local DSU client. Uses the standard DSU server address (127.0.0.1, port 26760), compatible with Dolphin, Cemu, and other DSU-supporting emulators.
+
+## GLOBAL SETTINGS (found under the Settings dropdown menu)
+Swap A/B and X/Y buttons - changes the layout to Nintendo ABXY instead of DualShock4
+
+</details>
 
 <details>
 <summary>Joy-Con 2 BLE Notification Layout</summary>
