@@ -99,6 +99,13 @@ DS4 Switch Emu: Same as DS4 Raw, but remaps gyro axes to match Switch controller
 
 DSU UDP: Sends gyro/accel data over the DSU protocol to a local DSU client. Uses the standard DSU server address (127.0.0.1, port 26760), compatible with Dolphin, Cemu, and other DSU-supporting emulators.
 
+- Mouse (Singular Joycons)
+Toggles the mouse input.
+- DPAD (Left Joycon)
+Toggles whether the left joycon's buttons map to DPAD or ABXY.
+- Remap (Sideways Singular Joycons)
+Toggles whether the buttons get rotated 90 degrees for sideways use (e.g X becomes A, Y becomes X)
+
 ## GLOBAL SETTINGS (found under the Settings dropdown menu)
 Swap A/B and X/Y buttons - changes the layout to Nintendo ABXY instead of DualShock4
 
