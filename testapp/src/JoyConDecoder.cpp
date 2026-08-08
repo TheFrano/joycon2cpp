@@ -313,6 +313,14 @@ constexpr uint32_t BUTTON_MINUS_MASK_LEFT = 0x000100;
 constexpr uint32_t BUTTON_L_MASK_LEFT     = 0x000040;
 constexpr uint32_t BUTTON_STICK_MASK_LEFT = 0x000800;
 
+constexpr uint32_t BUTTON_HOME_MASK_RIGHT    = 0x000010;
+constexpr uint32_t BUTTON_CAPTURE_MASK_RIGHT = 0x000020;
+constexpr uint32_t BUTTON_C_MASK_RIGHT       = 0x000040;
+
+constexpr uint32_t BUTTON_HOME_MASK_LEFT     = 0x001000;
+constexpr uint32_t BUTTON_CAPTURE_MASK_LEFT  = 0x002000;
+constexpr uint32_t BUTTON_C_MASK_LEFT        = 0x004000;
+
 StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation)
 {
     if (buffer.size() < 16) {
@@ -484,6 +492,7 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
         if (state & BUTTON_MINUS_MASK_LEFT)  report.Report.wButtons |= DS4_BUTTON_SHARE;
         if (state & BUTTON_L_MASK_LEFT)      report.Report.wButtons |= DS4_BUTTON_SHOULDER_LEFT;
         if (state & BUTTON_STICK_MASK_LEFT)  report.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;
+        if (state & BUTTON_CAPTURE_MASK_LEFT) report.Report.bSpecial |= DS4_SPECIAL_BUTTON_TOUCHPAD;
     } else {
         DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), DS4_BUTTON_DPAD_NONE);
         if (remap) {
@@ -500,6 +509,7 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
         if (state & BUTTON_PLUS_MASK_RIGHT)  report.Report.wButtons |= DS4_BUTTON_OPTIONS;
         if (state & BUTTON_R_MASK_RIGHT)     report.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;
         if (state & BUTTON_STICK_MASK_RIGHT) report.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;
+        if (state & BUTTON_HOME_MASK_RIGHT)  report.Report.bSpecial |= DS4_SPECIAL_BUTTON_TOUCHPAD;
     }
 
     auto [touchX, touchY] = DecodeMouseCoords(buffer);
