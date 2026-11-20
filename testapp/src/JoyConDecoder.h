@@ -5,6 +5,7 @@
 #include <string>
 #include <Windows.h>
 #include <ViGEm/Client.h>
+#include "MotionRemap.h"
 
 enum class JoyConSide { Left, Right };
 enum class JoyConOrientation { Upright, Sideways };
@@ -59,3 +60,6 @@ uint32_t ExtractButtonState(const std::vector<uint8_t>& buffer);
 std::pair<int16_t, int16_t> GetRawOpticalMouse(const std::vector<uint8_t>& buffer);
 StickData DecodeJoystick(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation);
 MotionData DecodeMotionRaw(const std::vector<uint8_t>& buffer);
+
+MotionAxisMap GetMotionAxisMap();
+void SetMotionAxisMap(const MotionAxisMap& map);

@@ -1198,6 +1198,59 @@ static void HelpMarker(const char* txt) {
     if (ImGui::IsItemHovered()) { ImGui::BeginTooltip(); ImGui::TextUnformatted(txt); ImGui::EndTooltip(); }
 }
 
+static const char* GYRO_MAP_FILE = "gyro_axis_map.txt";
+
+static void LoadGyroAxisMap() {
+    std::ifstream f(GYRO_MAP_FILE);
+    uint32_t v = 0;
+    if (f && (f >> v)) SetMotionAxisMap(UnpackMotionAxisMap(v));
+}
+
+static void SaveGyroAxisMap() {
+    std::ofstream f(GYRO_MAP_FILE, std::ios::trunc);
+    if (f) f << PackMotionAxisMap(GetMotionAxisMap());
+}
+
+static void DrawGyroAxisMapUI() {
+    ImGui::PushID("gyroaxismap");
+    MotionAxisMap m = GetMotionAxisMap();
+    bool changed = false;
+
+    const char* presets[] = {
+        "Raw - as the controller sends it (Cemu)",
+        "Switch -> DS4 axes (Switch emulators)",
+        "Custom"
+    };
+    int preset = (m == MotionAxisMapRaw()) ? 0 : (m == MotionAxisMapSwitchToDS4()) ? 1 : 2;
+    ImGui::SetNextItemWidth(320);
+    if (ImGui::Combo("Gyro axis mapping", &preset, presets, 3)) {
+        if (preset == 0)      { m = MotionAxisMapRaw();          changed = true; }
+        else if (preset == 1) { m = MotionAxisMapSwitchToDS4();  changed = true; }
+    }
+    ImGui::SameLine();
+    HelpMarker("The Switch 2 controllers report gyro/accel in Nintendo axis order, DS4/DSU expect a different one.\n"
+               "If swinging left/right in a Switch emulator registers as a twist (or the other way round), use\n"
+               "\"Switch -> DS4 axes\". Keep \"Raw\" for Cemu if it already works for you.\n"
+               "Applies immediately to every connected controller, for both DSU and the virtual DS4.");
+
+    const char* outNames[] = { "Pitch (X) from", "Yaw (Y) from  ", "Roll (Z) from " };
+    const char* srcNames[] = { "Raw X", "Raw Y", "Raw Z" };
+    for (int i = 0; i < 3; ++i) {
+        ImGui::PushID(i);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(outNames[i]);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        if (ImGui::Combo("##src", &m.src[i], srcNames, 3)) changed = true;
+        ImGui::SameLine();
+        if (ImGui::Checkbox("Invert", &m.invert[i])) changed = true;
+        ImGui::PopID();
+    }
+
+    if (changed) { SetMotionAxisMap(m); SaveGyroAxisMap(); }
+    ImGui::PopID();
+}
+
 static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
     ImGui::PushID(i);
     ImGui::TableNextRow();
@@ -1340,6 +1393,8 @@ static void DrawSetupScreen() {
 
         ImGui::Checkbox("Swap A/B and X/Y buttons", &g_opts.swapABXY);
         ImGui::SameLine(); HelpMarker("Swaps Nintendo A<->B and X<->Y for every connected controller (Single JoyCon, Dual JoyCon, Pro Controller, and NSO GC).");
+
+        DrawGyroAxisMapUI();
 
         ImGui::Unindent(10);
         ImGui::Spacing();
@@ -1926,6 +1981,8 @@ static void DrawRunningScreen() {
         ImGui::Checkbox("Swap A/B and X/Y buttons##run", &g_opts.swapABXY);
         ImGui::SameLine(); HelpMarker("Swaps Nintendo A<->B and X<->Y for every connected controller. Takes effect immediately.");
 
+        DrawGyroAxisMapUI();
+
         ImGui::Unindent(10); ImGui::Spacing();
     }
 
@@ -1975,6 +2032,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     init_apartment();
     LoadProConfig();
     LoadCalibrationProfiles("calibration.json");
+    LoadGyroAxisMap();
 
     if (g_playerConfigs.empty()) g_playerConfigs.push_back({});
 
