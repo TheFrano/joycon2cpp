@@ -1,6 +1,7 @@
 #include "JoyConDecoder.h"
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <ViGEm/Client.h>
 #include <ViGEm/Common.h>
 #include <cstdint>
@@ -15,6 +16,18 @@ int16_t to_signed_16(uint8_t lsb, uint8_t msb) {
 
 static std::vector<CalibrationProfile> g_calibrationProfiles;
 static int g_activeCalibrationIndex = 0;
+
+static std::atomic<uint32_t> g_motionAxisMapPacked{ PackMotionAxisMap(MotionAxisMapRaw()) };
+
+MotionAxisMap GetMotionAxisMap()
+{
+    return UnpackMotionAxisMap(g_motionAxisMapPacked.load(std::memory_order_relaxed));
+}
+
+void SetMotionAxisMap(const MotionAxisMap& map)
+{
+    g_motionAxisMapPacked.store(PackMotionAxisMap(map), std::memory_order_relaxed);
+}
 
 static CalibrationProfile MakeDefaultProfile()
 {
@@ -230,12 +243,19 @@ constexpr size_t JC2_GYRO_Z_OFFSET  = 0x3A;
 
 void ApplyMotionToReport(DS4_REPORT_EX& report, const MotionData& motion)
 {
-    report.Report.wAccelX = motion.accelX;
-    report.Report.wAccelY = motion.accelY;
-    report.Report.wAccelZ = motion.accelZ;
-    report.Report.wGyroX  = motion.gyroX;
-    report.Report.wGyroY  = motion.gyroY;
-    report.Report.wGyroZ  = motion.gyroZ;
+    const MotionAxisMap map = GetMotionAxisMap();
+    const int16_t accIn[3] = { motion.accelX, motion.accelY, motion.accelZ };
+    const int16_t gyrIn[3] = { motion.gyroX,  motion.gyroY,  motion.gyroZ  };
+    int16_t accOut[3], gyrOut[3];
+    RemapMotionAxes(accIn, accOut, map);
+    RemapMotionAxes(gyrIn, gyrOut, map);
+
+    report.Report.wAccelX = accOut[0];
+    report.Report.wAccelY = accOut[1];
+    report.Report.wAccelZ = accOut[2];
+    report.Report.wGyroX  = gyrOut[0];
+    report.Report.wGyroY  = gyrOut[1];
+    report.Report.wGyroZ  = gyrOut[2];
 }
 
 float ApplyCalibratedAxis(int raw, int center, int minVal, int maxVal)
